@@ -10,8 +10,71 @@
 #include "sr_router.h"
 #include "sr_if.h"
 #include "sr_protocol.h"
+#include "sr_rt.h"
 
 static volatile int keep_running_arpcache = 1;
+
+int modifyPacket(struct sr_instance *sr, struct sr_packet *packetIem)
+{
+    /*build fake src->dst packet(ARP???), except dst MAC (we will get it from interface)*/
+    sr_ip_hdr_t* ipHeader = (sr_ip_hdr_t*)(packetIem->buf + sizeof(sr_ethernet_hdr_t));
+    sr_ethernet_hdr_t *ethHeader = (sr_ethernet_hdr_t *)(packetIem->buf);
+
+    ipHeader->ip_dst = ipHeader->ip_src;
+    struct sr_rt *rtResult = checkRoutingTable(sr, packetIem->buf, packetIem->len);
+    if(rtResult == NULL)
+    {
+        return 0;
+    }
+    ipHeader->ip_dst = rtResult->gw.s_addr;
+    struct sr_if *lookUpDstIf = sr_get_interface(sr, rtResult->interface);
+    if(lookUpDstIf == NULL)
+        return 0;
+    packetIem->iface = lookUpDstIf->name;
+
+    struct sr_arpentry *arpLookUpResult = sr_arpcache_lookup(&(sr->cache), ipHeader->ip_src);
+    if(arpLookUpResult)
+    {
+        memcpy(ethHeader->ether_shost, arpLookUpResult->mac, ETHER_ADDR_LEN);
+        free(arpLookUpResult);
+    }
+    else /*need another ARP request*/
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+void handle_arpReq(struct sr_instance *sr, struct sr_arpreq *reqItem)
+{
+    struct timeval tv ;
+    gettimeofday(&tv, NULL);
+    if(tv.tv_sec - reqItem->sent >= 1)
+    {
+        if(reqItem->times_sent >= 5)
+        {            
+            struct sr_packet *packetItem = reqItem->packets;
+            while(packetItem)
+            {
+                int result = modifyPacket(sr, packetItem);
+                if(result != 0)
+                    generateICMP(sr, packetItem->buf, packetItem->len, packetItem->iface, TYPE_DST_UNREACHABLE, HOST_UNREACHABLE);
+                packetItem = packetItem->next;
+            }
+            
+            sr_arpreq_destroy(&(sr->cache), reqItem);
+    
+        }
+        else
+        {
+            sendARPReuqest(sr, reqItem->packets,reqItem->ip);
+            reqItem->sent = tv.tv_sec;
+            reqItem->times_sent++;
+        }
+    }
+}
+
 
 /* 
   This function gets called every second. For each request sent out, we keep
@@ -19,7 +82,12 @@ static volatile int keep_running_arpcache = 1;
   See the comments in the header file for an idea of what it should look like.
 */
 void sr_arpcache_sweepreqs(struct sr_instance *sr) { 
-    /* Fill this in */
+    struct sr_arpreq *reqItem = sr->cache.requests;
+    while(reqItem)
+    {
+        handle_arpReq(sr, reqItem);
+        reqItem = reqItem->next;
+    }
 }
 
 /* You should not need to touch the rest of this code. */

@@ -32,6 +32,13 @@
 #define INIT_TTL 255
 #define PACKET_DUMP_SIZE 1024
 
+#define TYPE_TIME_EXCEEDED 11
+#define CODE_TIME_EXCEEDED 0
+#define TYPE_DST_UNREACHABLE 3
+#define PORT_UNREACHABLE 3
+#define NET_UNREACHABLE 0
+#define HOST_UNREACHABLE 1
+
 /* forward declare */
 struct sr_if;
 struct sr_rt;
@@ -69,6 +76,9 @@ int sr_read_from_server(struct sr_instance* );
 /* -- sr_router.c -- */
 void sr_init(struct sr_instance* );
 void sr_handlepacket(struct sr_instance* , uint8_t * , unsigned int , char* );
+void generateICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned int len, char* interface/* lent */, uint8_t icmp_type, uint8_t icmp_code);
+struct sr_rt* checkRoutingTable(struct sr_instance* sr, uint8_t * packet, unsigned int len);
+void sendARPReuqest(struct sr_instance* sr, struct sr_packet *packetStruct, uint32_t ipAddr);
 
 /* -- sr_if.c -- */
 void sr_add_interface(struct sr_instance* , const char* );
