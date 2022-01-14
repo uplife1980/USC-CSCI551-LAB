@@ -93,13 +93,14 @@ int isValidIPPacket(uint8_t *data, unsigned int len)
     data += sizeof(sr_ethernet_hdr_t);
     len -= sizeof(sr_ethernet_hdr_t);
 
-    /*checksum*/
-    if(cksum(data, len) == 0xFFFF)
+    uint16_t checkSumResult = cksum(data, len);
+    if( checkSumResult == (uint16_t)0xFFFF)
     {
       return 1;
     }
     else{
-      /*printf("checksum invalid, will drop the packet!\n");*/
+
+      printf("checksum invalid, will NOT drop the packet! %d\n", checkSumResult);
       return 1;
     }
   }
@@ -225,7 +226,6 @@ void handleIncomingICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsi
 {
   uint8_t *data = packet + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t);
   
-  printf("get ICMP PACKET\n");
   switch (*data)
   {
     case 0x08:
@@ -247,7 +247,7 @@ void handleIncomingICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsi
       ipData->ip_src = ((sr_ip_hdr_t*)(packet + sizeof(sr_ethernet_hdr_t)))->ip_dst;
       ipData->ip_ttl = 255;
       ipData->ip_sum = 0;
-      ipData->ip_sum = cksum(ipData, sizeof(sr_ip_hdr_t));
+      ipData->ip_sum = (cksum(ipData, sizeof(sr_ip_hdr_t)));
       
       sr_icmp_hdr_t *icmpData = (sr_icmp_hdr_t*)((uint8_t*)ipData + sizeof(sr_ip_hdr_t));
 
@@ -255,7 +255,7 @@ void handleIncomingICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsi
       icmpData->icmp_type = 0;
       icmpData->icmp_code = 0;
       icmpData->icmp_sum = 0;
-      icmpData->icmp_sum = cksum(icmpData, ntohs(ipData->ip_len)-sizeof(sr_ip_hdr_t));
+      icmpData->icmp_sum = (cksum(icmpData, ntohs(ipData->ip_len)-sizeof(sr_ip_hdr_t)));
       
 
       sr_send_packet(sr, resData, len, interface);
@@ -276,6 +276,8 @@ void generateICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned i
   unsigned int resDataLen;
   if(icmp_type == TYPE_DST_UNREACHABLE)
     resDataLen= sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t);
+  else if(icmp_type == TYPE_TIME_EXCEEDED)
+    resDataLen = sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t) + 4;
   else
     resDataLen = sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t);
 
@@ -295,29 +297,41 @@ void generateICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned i
   ipData->ip_len = htons(sizeof(sr_ip_hdr_t)+sizeof(sr_icmp_t3_hdr_t));
   ipData->ip_ttl = 255;
   ipData->ip_sum = 0;
-  ipData->ip_sum = cksum(ipData, sizeof(sr_ip_hdr_t));
+  ipData->ip_sum = (cksum(ipData, sizeof(sr_ip_hdr_t)));
 
   if(icmp_type == TYPE_DST_UNREACHABLE)
   {
     sr_icmp_t3_hdr_t *icmpData = (sr_icmp_t3_hdr_t*)((uint8_t*)ipData + sizeof(sr_ip_hdr_t));
     icmpData->icmp_type = icmp_type;
     icmpData->icmp_code = icmp_code;
+    memcpy(icmpData->data, (sr_ip_hdr_t*)(packet+sizeof(sr_ethernet_hdr_t)), ICMP_DATA_SIZE);
     icmpData->icmp_sum = 0;
-    icmpData->icmp_sum = cksum(icmpData, ntohs(sizeof(sr_icmp_t3_hdr_t)));
+    icmpData->icmp_sum = (cksum(icmpData, sizeof(sr_icmp_t3_hdr_t)));
   }
   else
   {
     sr_icmp_hdr_t *icmpData = (sr_icmp_hdr_t*)((uint8_t*)ipData + sizeof(sr_ip_hdr_t));
     icmpData->icmp_type = icmp_type;
     icmpData->icmp_code = icmp_code;
+
+    if(icmp_type == TYPE_TIME_EXCEEDED)
+    {
+      uint32_t* unusedArea = (uint32_t*)(((uint8_t*)icmpData+sizeof(sr_icmp_hdr_t)));
+      *unusedArea = 0;
+    }
     icmpData->icmp_sum = 0;
-    icmpData->icmp_sum = cksum(icmpData, ntohs(sizeof(sr_icmp_hdr_t)));
+    icmpData->icmp_sum = (cksum(icmpData, sizeof(sr_icmp_hdr_t)));
+    
+
   }
   
-
-  sr_send_packet(sr, resData, len, interface);
-
+  
+  sr_send_packet(sr, resData, resDataLen, interface);
   free(resData);
+  return;
+  
+  
+  
 }
 
 void handleTCP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned int len, char* interface/* lent */)
@@ -336,15 +350,20 @@ int calcMatchLevel( uint32_t addr1,  struct sr_rt* rt)
 
   int matchLevel = 0;
 
-  uint32_t rtNetAddr = (rt->mask.s_addr)&(rt->dest.s_addr);
+  uint32_t rtNetAddr = rt->dest.s_addr;
+  uint32_t rtNetMask = rt->mask.s_addr;
 
-  while(matchLevel < 32)
+  while(rtNetMask)
   {
-    if((addr1&(uint8_t)(0x01)) != (rtNetAddr&(uint8_t)(0x01))) 
+    if((addr1&(uint8_t)(0x01)) != (rtNetAddr&(uint8_t)(0x01)))
+    {
+      matchLevel = 0;
       break;
+    }
 
     addr1 >>= 1;
     rtNetAddr >>= 1;
+    rtNetMask >>= 1;
     matchLevel++;
   }
 
@@ -368,7 +387,7 @@ struct sr_rt* checkRoutingTable(struct sr_instance* sr, uint8_t * packet, unsign
 
   while(currRt)
   {
-    if(currRt->mask.s_addr == 0) defaultRoute = currRt;
+    if(currRt->mask.s_addr == 0 && currRt->dest.s_addr == 0) defaultRoute = currRt;
 
     int tempMatchLevel = calcMatchLevel(ipData->ip_dst, currRt);
     if(tempMatchLevel > maxMatchLevel)
@@ -397,6 +416,7 @@ void sendARPReuqest(struct sr_instance* sr, struct sr_packet *packetStruct, uint
 
   int dataLen = sizeof(sr_ethernet_hdr_t)+sizeof(sr_arp_hdr_t);
   uint8_t *resData = (uint8_t*)malloc(sizeof(uint8_t)* dataLen);
+
   sr_ethernet_hdr_t *ethData = (sr_ethernet_hdr_t *)resData;   
   sr_arp_hdr_t * arpData = (sr_arp_hdr_t*)(resData+sizeof(sr_ethernet_hdr_t));
 
@@ -437,16 +457,25 @@ void forwardPacket(struct sr_instance* sr, uint8_t * packet, unsigned int len, c
   }
 
   struct sr_arpentry *arpLookUpResult = sr_arpcache_lookup(&(sr->cache), rt->gw.s_addr);
+
+  if(!arpLookUpResult)
+  {
+    /*DONT do any edit in this packet, in case we need to send ICMP_UNREACHABLE to the origin */
+    struct sr_arpreq *arpReq = sr_arpcache_queuereq(&(sr->cache), rt->gw.s_addr, resData, len, rt->interface);
+
+    handle_arpReq(sr, arpReq);
+    free(resData);
+    return ;
+  }
   
   
   sr_ethernet_hdr_t *ethData = (sr_ethernet_hdr_t *)resData;    
 
   memcpy(ethData->ether_shost, sourceInterface->addr, ETHER_ADDR_LEN);
-  if(arpLookUpResult)
-  {
-    memcpy(ethData->ether_dhost, arpLookUpResult->mac, ETHER_ADDR_LEN);
-    free(arpLookUpResult);
-  }
+  
+  memcpy(ethData->ether_dhost, arpLookUpResult->mac, ETHER_ADDR_LEN);
+  free(arpLookUpResult);
+  
 
   sr_ip_hdr_t *ipData = (sr_ip_hdr_t*)((uint8_t*)resData + sizeof(sr_ethernet_hdr_t));
   ipData->ip_ttl -= 1;
@@ -458,19 +487,12 @@ void forwardPacket(struct sr_instance* sr, uint8_t * packet, unsigned int len, c
     return;
   }
   ipData->ip_sum = 0;
-  ipData->ip_sum = cksum(ipData, sizeof(sr_ip_hdr_t));
+  ipData->ip_sum = (cksum(ipData, sizeof(sr_ip_hdr_t)));
 
-  if(arpLookUpResult)
-  {
-    sr_send_packet(sr, resData, len, rt->interface);
-    free(resData);
-  }
-  else
-  {
-    struct sr_arpreq *arpReq = sr_arpcache_queuereq(&(sr->cache), rt->gw.s_addr, resData, len, rt->interface);
-
-    handle_arpReq(sr, arpReq);
-  }
+  
+  sr_send_packet(sr, resData, len, rt->interface);
+  free(resData);
+  
 
 }
 
@@ -478,7 +500,7 @@ void handleARPResponse(struct sr_instance* sr, uint8_t * packet/* lent */, unsig
 {
   sr_arp_hdr_t * arpData = (sr_arp_hdr_t*)(packet+sizeof(sr_ethernet_hdr_t));
 
-  struct sr_arpreq *req = sr_arpcache_insert(&(sr->cache), arpData->ar_sha, arpData->ar_sip);
+  struct sr_arpreq *req = sr_arpcache_insert(&(sr->cache), arpData->ar_sha, (arpData->ar_sip));
   if(!req)
     return;
 
@@ -487,11 +509,14 @@ void handleARPResponse(struct sr_instance* sr, uint8_t * packet/* lent */, unsig
 
   while(watingPacket)
   {
-    sr_ethernet_hdr_t *ethData = (sr_ethernet_hdr_t *)watingPacket->buf;
-    memcpy(ethData->ether_dhost, arpData->ar_sha, ETHER_ADDR_LEN);
-    
 
-    sr_send_packet(sr, watingPacket->buf, watingPacket->len, watingPacket->iface);
+    struct sr_rt* routingTableItem = checkRoutingTable(sr, watingPacket->buf, watingPacket->len);
+    if(routingTableItem != NULL)
+    {
+      forwardPacket(sr, watingPacket->buf, watingPacket->len, watingPacket->iface, routingTableItem);
+      free(watingPacket->buf);
+      watingPacket->buf = NULL;
+    }
     
     watingPacket = watingPacket->next;
     
@@ -510,7 +535,7 @@ void sr_handlepacket(struct sr_instance* sr,
   assert(packet);
   assert(interface);
 
-  printf("*** -> Received packet of length %d \n",len);
+  /*printf("*** -> Received packet of length %d \n",len);*/
 
   if(isARP(packet, len))
   {
@@ -584,7 +609,7 @@ void sr_handlepacket(struct sr_instance* sr,
   else
   {
     /*drop it*/
-    printf("drop one");
+    /*printf("unknown packet, drop.\n");*/
   }
 
 }/* end sr_ForwardPacket */

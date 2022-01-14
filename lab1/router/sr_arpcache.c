@@ -14,36 +14,30 @@
 
 static volatile int keep_running_arpcache = 1;
 
-int modifyPacket(struct sr_instance *sr, struct sr_packet *packetIem)
+char* getSendBackInterface(struct sr_if* ifList, struct sr_packet *packetItem)
 {
-    /*build fake src->dst packet(ARP???), except dst MAC (we will get it from interface)*/
-    sr_ip_hdr_t* ipHeader = (sr_ip_hdr_t*)(packetIem->buf + sizeof(sr_ethernet_hdr_t));
-    sr_ethernet_hdr_t *ethHeader = (sr_ethernet_hdr_t *)(packetIem->buf);
-
-    ipHeader->ip_dst = ipHeader->ip_src;
-    struct sr_rt *rtResult = checkRoutingTable(sr, packetIem->buf, packetIem->len);
-    if(rtResult == NULL)
+    sr_ethernet_hdr_t *ethData = (sr_ethernet_hdr_t *)packetItem->buf;
+    uint8_t *ethAddr = ethData->ether_dhost;
+    while(ifList)
     {
-        return 0;
-    }
-    ipHeader->ip_dst = rtResult->gw.s_addr;
-    struct sr_if *lookUpDstIf = sr_get_interface(sr, rtResult->interface);
-    if(lookUpDstIf == NULL)
-        return 0;
-    packetIem->iface = lookUpDstIf->name;
-
-    struct sr_arpentry *arpLookUpResult = sr_arpcache_lookup(&(sr->cache), ipHeader->ip_src);
-    if(arpLookUpResult)
-    {
-        memcpy(ethHeader->ether_shost, arpLookUpResult->mac, ETHER_ADDR_LEN);
-        free(arpLookUpResult);
-    }
-    else /*need another ARP request*/
-    {
-        return 0;
+        int i;
+        int isFailed = 0;
+        for(i = 0; i < 6; i++)
+        {
+            if(ethAddr[i] != (ifList->addr)[i])
+            {
+                isFailed = 1;
+                break;
+            }
+        }
+        if(isFailed == 0)
+        {
+            return ifList->name;
+        }
+        ifList = ifList->next;
     }
 
-    return 1;
+    return NULL;
 }
 
 void handle_arpReq(struct sr_instance *sr, struct sr_arpreq *reqItem)
@@ -53,24 +47,27 @@ void handle_arpReq(struct sr_instance *sr, struct sr_arpreq *reqItem)
     if(tv.tv_sec - reqItem->sent >= 1)
     {
         if(reqItem->times_sent >= 5)
-        {            
+        { 
             struct sr_packet *packetItem = reqItem->packets;
             while(packetItem)
             {
-                int result = modifyPacket(sr, packetItem);
-                if(result != 0)
-                    generateICMP(sr, packetItem->buf, packetItem->len, packetItem->iface, TYPE_DST_UNREACHABLE, HOST_UNREACHABLE);
+                char* interface = getSendBackInterface(sr->if_list, packetItem);
+                if(interface)
+                {
+                    generateICMP(sr, packetItem->buf, packetItem->len, interface, TYPE_DST_UNREACHABLE, HOST_UNREACHABLE);
+                }
+            
                 packetItem = packetItem->next;
             }
             
             sr_arpreq_destroy(&(sr->cache), reqItem);
     
         }
-        else
+        else if(reqItem->times_sent < 5)
         {
             sendARPReuqest(sr, reqItem->packets,reqItem->ip);
             reqItem->sent = tv.tv_sec;
-            reqItem->times_sent++;
+            (reqItem->times_sent)++;
         }
     }
 }
@@ -85,8 +82,9 @@ void sr_arpcache_sweepreqs(struct sr_instance *sr) {
     struct sr_arpreq *reqItem = sr->cache.requests;
     while(reqItem)
     {
+        struct sr_arpreq* nextReq = reqItem->next;
         handle_arpReq(sr, reqItem);
-        reqItem = reqItem->next;
+        reqItem = nextReq;
     }
 }
 
