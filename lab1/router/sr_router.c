@@ -91,16 +91,15 @@ int isValidIPPacket(uint8_t *data, unsigned int len)
   if(ethertype(data) == 2048)
   {
     data += sizeof(sr_ethernet_hdr_t);
-    len -= sizeof(sr_ethernet_hdr_t);
 
-    uint16_t checkSumResult = cksum(data, len);
+    uint16_t checkSumResult = cksum(data, sizeof(sr_ip_hdr_t));
     if( checkSumResult == (uint16_t)0xFFFF)
     {
       return 1;
     }
     else{
 
-      printf("checksum invalid, will NOT drop the packet! %d\n", checkSumResult);
+      printf("checksum invalid, will NOT drop the packet! %x\n", checkSumResult);
       return 1;
     }
   }
