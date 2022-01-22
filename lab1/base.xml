@@ -19,6 +19,7 @@
 
 <!-- Set up things needed for this test -->
 <startup>
+  <run_command>sleep 5</run_command>
   <run_command>./run_sr.sh -normal</run_command>
 </startup>
 
