@@ -348,10 +348,25 @@ int calcMatchLevel( uint32_t addr1,  struct sr_rt* rt)
   if(!rt) return 0;  
 
   int matchLevel = 0;
+  
+  
 
-  uint32_t rtNetAddr = rt->dest.s_addr;
-  uint32_t rtNetMask = rt->mask.s_addr;
+  addr1 = ntohl(addr1);
+  uint32_t rtNetAddr = ntohl(rt->dest.s_addr);
+  uint32_t rtNetMask = ntohl(rt->mask.s_addr);
+  uint32_t testbit = 1<<31;
 
+  while(rtNetMask & testbit)
+  {
+    if((rtNetAddr & testbit) != (addr1 & testbit))
+    {
+      matchLevel = 0;
+      break;
+    }
+    testbit >>=1;
+    matchLevel++;
+  }
+  /*
   while(rtNetMask)
   {
     if((addr1&(uint8_t)(0x01)) != (rtNetAddr&(uint8_t)(0x01)))
@@ -364,7 +379,7 @@ int calcMatchLevel( uint32_t addr1,  struct sr_rt* rt)
     rtNetAddr >>= 1;
     rtNetMask >>= 1;
     matchLevel++;
-  }
+  }*/
 
   return matchLevel;
 
