@@ -1,0 +1,26 @@
+!
+! Zebra configuration saved from vty
+!   2022/02/05 21:30:36
+!
+hostname G4_KANS
+password G4_KANS
+log file /var/log/quagga/bgpd_G4_KANS.log
+!
+router bgp 4
+ bgp router-id 4.105.0.2
+ bgp graceful-restart
+ neighbor lo peer-group
+ neighbor lo remote-as 4
+ neighbor lo update-source host
+ neighbor lo next-hop-self
+ neighbor 4.101.0.2 peer-group lo
+ neighbor 4.102.0.2 peer-group lo
+ neighbor 4.103.0.2 peer-group lo
+ neighbor 4.104.0.2 peer-group lo
+ neighbor 4.106.0.2 peer-group lo
+ neighbor 4.107.0.2 peer-group lo
+ neighbor 4.108.0.2 peer-group lo
+ neighbor 4.109.0.2 peer-group lo
+!
+line vty
+!
