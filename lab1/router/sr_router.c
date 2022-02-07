@@ -271,12 +271,13 @@ void handleIncomingICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsi
 void generateICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned int len, char* interface/* lent */, uint8_t icmp_type, uint8_t icmp_code)
 {
   struct sr_if* interfaceStruct = sr_get_interface(sr, interface);
+  int appendDataLen = ((len > 576)? 576 :len) - sizeof(sr_ethernet_hdr_t);
 
   unsigned int resDataLen;
   if(icmp_type == TYPE_DST_UNREACHABLE)
     resDataLen= sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t);
   else if(icmp_type == TYPE_TIME_EXCEEDED)
-    resDataLen = sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t) + 4;
+    resDataLen = sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t)  + 4 + appendDataLen;
   else
     resDataLen = sizeof(sr_ethernet_hdr_t)+ sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_hdr_t);
 
@@ -293,7 +294,7 @@ void generateICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned i
   ipData->ip_p = 1 ;
   ipData->ip_dst = ((sr_ip_hdr_t*)(packet + sizeof(sr_ethernet_hdr_t)))->ip_src;
   ipData->ip_src = interfaceStruct->ip;
-  ipData->ip_len = htons(sizeof(sr_ip_hdr_t)+sizeof(sr_icmp_t3_hdr_t));
+  ipData->ip_len = htons(resDataLen - sizeof(sr_ethernet_hdr_t));
   ipData->ip_ttl = 255;
   ipData->ip_sum = 0;
   ipData->ip_sum = (cksum(ipData, sizeof(sr_ip_hdr_t)));
@@ -317,6 +318,8 @@ void generateICMP(struct sr_instance* sr, uint8_t * packet/* lent */, unsigned i
     {
       uint32_t* unusedArea = (uint32_t*)(((uint8_t*)icmpData+sizeof(sr_icmp_hdr_t)));
       *unusedArea = 0;
+      uint8_t* appenData = (uint8_t*)unusedArea + 4;
+      memcpy(appenData, (packet + sizeof(sr_ethernet_hdr_t)), appendDataLen);
     }
     icmpData->icmp_sum = 0;
     icmpData->icmp_sum = (cksum(icmpData, sizeof(sr_icmp_hdr_t)));
@@ -484,6 +487,7 @@ void forwardPacket(struct sr_instance* sr, uint8_t * packet, unsigned int len, c
 
   if(!arpLookUpResult)
   {
+    ipData->ip_ttl += 1;
     /*DONT do any edit in this packet, in case we need to send ICMP_UNREACHABLE to the origin */
     struct sr_arpreq *arpReq = sr_arpcache_queuereq(&(sr->cache), rt->gw.s_addr, resData, len, rt->interface);
 
