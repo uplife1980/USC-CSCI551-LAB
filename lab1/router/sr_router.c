@@ -470,6 +470,16 @@ void forwardPacket(struct sr_instance* sr, uint8_t * packet, unsigned int len, c
     return;
   }
 
+  sr_ip_hdr_t *ipData = (sr_ip_hdr_t*)((uint8_t*)resData + sizeof(sr_ethernet_hdr_t));
+  ipData->ip_ttl -= 1;
+  if(ipData->ip_ttl == 0)
+  {
+    /* TTL == 0, drop the packet*/
+    generateICMP(sr, packet, len, interface, TYPE_TIME_EXCEEDED, CODE_TIME_EXCEEDED);
+    free(resData);
+    return;
+  }
+
   struct sr_arpentry *arpLookUpResult = sr_arpcache_lookup(&(sr->cache), rt->gw.s_addr);
 
   if(!arpLookUpResult)
@@ -491,15 +501,7 @@ void forwardPacket(struct sr_instance* sr, uint8_t * packet, unsigned int len, c
   free(arpLookUpResult);
   
 
-  sr_ip_hdr_t *ipData = (sr_ip_hdr_t*)((uint8_t*)resData + sizeof(sr_ethernet_hdr_t));
-  ipData->ip_ttl -= 1;
-  if(ipData->ip_ttl == 0)
-  {
-    /* TTL == 0, drop the packet*/
-    generateICMP(sr, packet, len, interface, TYPE_TIME_EXCEEDED, CODE_TIME_EXCEEDED);
-    free(resData);
-    return;
-  }
+ 
   ipData->ip_sum = 0;
   ipData->ip_sum = (cksum(ipData, sizeof(sr_ip_hdr_t)));
 
