@@ -42,6 +42,10 @@ typedef struct  {
   char *data;
   size_t len;
   size_t usedLen; //legnth that has been read
+
+  //just for sentUnackList
+  int retryTime;
+  long lastSentTime;
 }buffer_t;
 #define BUFFER_SIZE 64
 
