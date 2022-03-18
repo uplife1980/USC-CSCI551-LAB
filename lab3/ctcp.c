@@ -40,11 +40,15 @@ struct ctcp_state {
                                this if this is the case for you */
 
   uint16_t sendWindow, recvWindow;
+  uint16_t inflightData;
   int rtt;
   int timer;
   uint32_t seqNum, ackNum, lastAckedSeq;
-  bool stopRecv, prepareSendFIN, sentFIN;
+  bool stopRecv; //I received FIN from peer
   bool singleACKUpdate; //No data to send, just ACK empty packet
+
+  //0--NO FIN, 1--prepare to send FIN 2--has sent FIN
+  uint8_t prepareSendFINStatus;
 
 
 };
@@ -102,13 +106,13 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->timer = cfg->timer;
   free(cfg);
 
-  state->seqNum = 0;
-  state->ackNum = 0;
-  state->lastAckedSeq = 0;
+  state->seqNum = 1;
+  state->ackNum = 1;
+  state->lastAckedSeq = 1;
+  state->inflightData = 0;
   state->stopRecv = false;
-  state->prepareSendFIN = false;
+  state->prepareSendFINStatus = 0;
   state->singleACKUpdate = false;
-  state->sentFIN = false;
 
   return state;
 }
@@ -147,9 +151,9 @@ void ctcp_destroy(ctcp_state_t *state) {
   *state->prev = state->next;
   conn_remove(state->conn);
 
-  //cleanBufferList(state->unsentList);
-  //cleanBufferList(state->sentUnackList);
-  //cleanBufferList(state->unsubmitedList);
+  cleanBufferList(state->unsentList);
+  cleanBufferList(state->sentUnackList);
+  cleanBufferList(state->unsubmitedList);
 
   free(state);
   end_client();
@@ -159,13 +163,12 @@ void ctcp_destroy(ctcp_state_t *state) {
 void trySend(ctcp_state_t *state)
 {
   ll_node_t *bufNode = ll_front(state->unsentList);
-  if(!bufNode && !state->prepareSendFIN && !state->singleACKUpdate)
+  if(!bufNode && !(state->prepareSendFINStatus == 1) && !state->singleACKUpdate)
     return;
   
-  //printf("\n The reason I send: %d %d %d \n", bufNode?1:0, (state->prepareSendFIN)? 1:0, (state->singleACKUpdate)? 1:0);
 
   bool shouldInsertToUnackList = true;
-  if(!bufNode && !state->prepareSendFIN)
+  if(!bufNode && (state->prepareSendFINStatus !=1 ))
     shouldInsertToUnackList = false;
   
   uint32_t totalUnsentLen = 0;
@@ -187,7 +190,12 @@ void trySend(ctcp_state_t *state)
 
   /*decide how much to send*/
   int dataLen = MAX_SEG_DATA_SIZE > totalUnsentLen? totalUnsentLen: MAX_SEG_DATA_SIZE;
-  dataLen = dataLen > state->sendWindow? state->sendWindow: dataLen;
+  uint16_t limitBySendWindow = (state->sendWindow - state->inflightData >= 0)? (state->sendWindow - state->inflightData): 0;
+  if(limitBySendWindow == 0)
+  {
+    shouldInsertToUnackList = false;
+  }
+  dataLen = dataLen > limitBySendWindow? limitBySendWindow: dataLen;
 
   int pos = 0;
   ctcp_segment_t *segment = malloc(sizeof(ctcp_segment_t) + dataLen);
@@ -203,7 +211,6 @@ void trySend(ctcp_state_t *state)
 
     if(dataLen >= buf->len - buf->usedLen)
     {
-      printf("\n memcpy1 \n");
       memcpy(data+pos, buf->data+buf->usedLen, buf->len - buf->usedLen);
       pos += buf->len - buf->usedLen;
       dataLen -= buf->len - buf->usedLen;
@@ -213,7 +220,6 @@ void trySend(ctcp_state_t *state)
     }
     else
     {
-      printf("\n memcpy2 \n");
       memcpy(data+pos, buf->data+buf->usedLen, dataLen);
       buf->usedLen += dataLen;   
 
@@ -228,26 +234,24 @@ void trySend(ctcp_state_t *state)
   segment->len = htons(sizeof(ctcp_segment_t) + dataLen);
   segment->flags = 0;
   segment->flags |= TH_ACK;
-  //if(state->singleACKUpdate)  
   state->singleACKUpdate = false;
   
-  if(totalUnsentLen == dataLen && state->prepareSendFIN)
+  if(totalUnsentLen == dataLen && (state->prepareSendFINStatus == 1))
   {
     segment->flags |= TH_FIN;
-    state->sentFIN = true;
+    state->prepareSendFINStatus |= 2;
     if(dataLen == 0)
     {
       state->seqNum ++;
     }
   }
-  state->sendWindow -= dataLen;
+  
   segment->window = htons(state->recvWindow);
   segment->cksum = 0;
 
   segment->cksum = cksum((void*)segment, sizeof(ctcp_segment_t) + dataLen);
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
-  int temp = sizeof(ctcp_segment_t) + dataLen;
-  printf("\n I have sent %d data\n", temp);
+
   state->seqNum += dataLen;
 
   //backupData
@@ -260,6 +264,17 @@ void trySend(ctcp_state_t *state)
     ll_add(state->sentUnackList, unackedBuf);
     unackedBuf->data = (char*)segment;
     unackedBuf->len = sizeof(ctcp_segment_t) + dataLen;
+    if((state->prepareSendFINStatus & 1) && dataLen == 0)
+    {
+      unackedBuf->len++;
+    }
+    state->inflightData += dataLen;
+  }
+
+  //Switch prepareSendFINStatus to 2
+  if(state->prepareSendFINStatus & 1)
+  {
+    state->prepareSendFINStatus -= 1;
   }
   
   
@@ -277,7 +292,7 @@ void ctcp_read(ctcp_state_t *state) {
     int resLen = conn_input(state->conn, buf->data, buf->len);
     if(resLen == -1)
     {
-      state->prepareSendFIN = true;
+      state->prepareSendFINStatus |= 1;
       break;
     }
     buf->len = resLen;
@@ -287,57 +302,48 @@ void ctcp_read(ctcp_state_t *state) {
   
   cleanBuffer(buf);
   
-  trySend(state);
+  //trySend(state);
   
 
 }
 
 void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
-  /*checksum*/
   uint16_t seglen = ntohs(segment->len);
   uint32_t ackno = ntohl(segment->ackno);
   uint32_t seqno = ntohl(segment->seqno);
-  //print_hdr_ctcp(segment);
-  printf("\nI get something!\n");
 
-  if((len < seglen))
+  if(cksum((void*)segment, seglen) != 0xffff || (len < seglen))
   {
     
-    fprintf(stderr, "invaild checksum %d, %d\n", (int)seglen, (int)len);
+    //fprintf(stderr, "invaild checksum=%d, segLen=%d, len=%d\n", cksum((void*)segment, seglen), (int)seglen, (int)len);
     free(segment);
     return;
   }
 
-  
-  if(seqno!= state->ackNum)
+  // I need former packet
+  if(seqno != state->ackNum)
   {
-    if(state->ackNum == 0)
-    {
-      state->ackNum = seqno;
-    }
-    else
-    {
-      fprintf(stderr, "invaild seqNum, I need %d, but get %d \n", (int)(state->ackNum), seqno);
-      free(segment);
-      trySend(state);
-      return;
-    }
-    
+    //fprintf(stderr, "invalid seqNum, I need %d, but get %d \n", (int)(state->ackNum), seqno);
+    state->singleACKUpdate = true;
+    free(segment);
+    trySend(state);
+    return;    
   }
 
   /*adjust ACK number*/
   state->ackNum += seglen - sizeof(ctcp_segment_t);
   state->sendWindow = ntohs(segment->window);
 
-  /*adjust lastAckedSeq number*/
-  //if(seqno >= state->lastAckedSeq)
-  //{
-  if(seglen - sizeof(ctcp_segment_t) != 0)
+  if(seglen - sizeof(ctcp_segment_t) != 0 || (segment->flags & TH_FIN))
     state->singleACKUpdate = true;
 
   uint32_t ackedDataLen = ackno - state->lastAckedSeq;
   state->lastAckedSeq =  ackno;
 
+  state->inflightData -= ackedDataLen;
+
+  //delete sentUnackList's object
+  //Also, FIN packet's len == 1, but it's an empty segment.
   while(ackedDataLen)
   {
     ll_node_t *bufNode = ll_front(state->sentUnackList);
@@ -345,28 +351,28 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     
     ackedDataLen -= buf->len - sizeof(ctcp_segment_t);
     ll_remove(state->sentUnackList, bufNode);
+    free(buf->data);
     free(buf); //this buf is a fake segment, not buf
     
     
   }
-  //}
   
   /*adjust recvWindow*/
-  state->recvWindow += seglen - sizeof(ctcp_segment_t);
+  state->recvWindow -= seglen - sizeof(ctcp_segment_t);
 
+  //deal with FIN
   if(segment->flags & TH_FIN)
   {
-    /*deal with FIN*/
-    if(seglen == 0)
+    if(seglen - sizeof(ctcp_segment_t) == 0)
       state->ackNum++;
     conn_output(state->conn, NULL, 0);
     state->stopRecv = true;
   }
 
+  //prepare to submit peer's data
   buffer_t *buf = calloc(sizeof(buffer_t), 1);
   buf->len = seglen - sizeof(ctcp_segment_t);
   buf->data = malloc(buf->len);
-  printf("\n memcpy3 \n");
   memcpy(buf->data, segment->data, buf->len);
 
   if(buf->len)
@@ -387,7 +393,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
 
 void ctcp_output(ctcp_state_t *state) {
   size_t availableSize = conn_bufspace(state->conn);
-
+  uint16_t hasOutputCount = 0;
   while(availableSize && ll_length(state->unsubmitedList))
   {
     ll_node_t *bufNode = ll_front(state->unsubmitedList);
@@ -397,15 +403,28 @@ void ctcp_output(ctcp_state_t *state) {
       conn_output(state->conn, buf->data+buf->usedLen, buf->len - buf->usedLen);
       ll_remove(state->unsubmitedList, bufNode);
       cleanBuffer(buf);
+      hasOutputCount += buf->len - buf->usedLen;
       break;
     }
     else
     {
       conn_output(state->conn, buf->data + buf->usedLen, availableSize);
       buf->usedLen += availableSize;
+      hasOutputCount += availableSize;
     }
-    
   }
+  bool needTellSenderZeroWindow = false;
+  if(state->recvWindow == 0)
+  {
+    needTellSenderZeroWindow = true;
+  }
+  state->recvWindow += hasOutputCount;
+  if(needTellSenderZeroWindow)
+  {
+    state->singleACKUpdate = true;
+    trySend(state);
+  }
+  
 }
 
 void ctcp_timer() {
@@ -413,9 +432,10 @@ void ctcp_timer() {
   ctcp_state_t *currentState = state_list;
   while(currentState)
   {
+    trySend(currentState);
     ll_node_t *bufObj = ll_front(currentState->sentUnackList);
     bool shouldDestroy = false;
-    if(!bufObj && currentState->sentFIN && currentState->stopRecv)
+    if(!bufObj && (currentState->prepareSendFINStatus & 2) && currentState->stopRecv)
     {
       shouldDestroy = true;
     }
@@ -425,16 +445,16 @@ void ctcp_timer() {
       long currentTime = current_time();
       if(currentTime - buf->lastSentTime > currentState->rtt)
       {
-          if(buf->retryTime == 5)
+          if(buf->retryTime == 4)
           {
             shouldDestroy = true;
             break;
           }
 
           ctcp_segment_t *segment = (ctcp_segment_t*)(buf->data);
-          int temp = buf->len ;
+
           conn_send(currentState->conn, segment ,buf->len);
-          printf("\n I have sent %d retry data\n",temp);
+
           buf->lastSentTime = currentTime;
           buf->retryTime++;
 

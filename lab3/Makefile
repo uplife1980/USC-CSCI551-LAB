@@ -35,4 +35,4 @@ submit: clean
 	@echo
 
 clean:
-	rm -f .*.d *.o $(TAR) *~ ctcp
+	rm -f .*.d *.o $(TAR) *~ ctcp *.csv core
