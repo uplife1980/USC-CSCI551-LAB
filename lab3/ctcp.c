@@ -135,7 +135,8 @@ void cleanBufferList(linked_list_t* list)
   while(p)
   {
     cleanBuffer((buffer_t*)(p->object));
-    ll_remove(list, p);
+    void *obj = ll_remove(list, p);
+    cleanBuffer((buffer_t *)obj);
     p = ll_front(list);
   }
 
@@ -270,6 +271,10 @@ void trySend(ctcp_state_t *state)
     }
     state->inflightData += dataLen;
   }
+  else
+  {
+    free(segment);
+  }
 
   //Switch prepareSendFINStatus to 2
   if(state->prepareSendFINStatus & 1)
@@ -398,12 +403,13 @@ void ctcp_output(ctcp_state_t *state) {
   {
     ll_node_t *bufNode = ll_front(state->unsubmitedList);
     buffer_t *buf = bufNode->object;
-    if(availableSize > buf->len - buf->usedLen)
+    if(availableSize >= buf->len - buf->usedLen)
     {
       conn_output(state->conn, buf->data+buf->usedLen, buf->len - buf->usedLen);
       ll_remove(state->unsubmitedList, bufNode);
-      cleanBuffer(buf);
+      
       hasOutputCount += buf->len - buf->usedLen;
+      cleanBuffer(buf);
       break;
     }
     else
