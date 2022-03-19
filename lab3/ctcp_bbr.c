@@ -25,12 +25,6 @@
  * You should add to this to store other fields you might need.
  */
 
-enum bbr_status_t{
-    STARTUP,
-    BALANCE,
-    DRAIN
-};
-
 struct ctcp_state {
   struct ctcp_state *next;  /* Next in linked list */
   struct ctcp_state **prev; /* Prev in linked list */
@@ -60,9 +54,9 @@ struct ctcp_state {
   //for bbr
   long lastTouchMinRTTTime, lastTouchMaxBWTime;
   uint32_t estimateBandWidth; // B/s
-  enum bbr_status_t bbr_status;
   double gain;
   long lastSentTime;
+  FILE *bdpFile;
 
 
 };
@@ -129,9 +123,9 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->singleACKUpdate = false;
 
   state->lastSentTime = state->lastTouchMinRTTTime = state->lastTouchMaxBWTime = current_time();
-  state->bbr_status = STARTUP;
   state->estimateBandWidth = 1000;
   state->gain = 1.1;
+  state->bdpFile = fopen("log.txt", "a+");
   
 
   return state;
@@ -182,13 +176,17 @@ void ctcp_destroy(ctcp_state_t *state) {
 
 uint32_t getBBRLimit(ctcp_state_t *state)
 {
+    long currentTime = current_time();
     int bdp = state->estimateBandWidth * state->rtt;
+    char tempString [255];
+    fprintf(tempString, 255, "%l,%d", currentTime, bdp);
+    fprintf(state->bdpFile, tempString);
     if(state->inflightData >= bdp * state->gain)
     {
         return 0;
     }
 
-    long waitTime = current_time() - state->lastSentTime;
+    long waitTime = currentTime - state->lastSentTime;
     return state->gain * waitTime * state->estimateBandWidth / 1000;
 }
 
