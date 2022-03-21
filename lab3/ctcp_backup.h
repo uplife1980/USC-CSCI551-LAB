@@ -46,13 +46,9 @@ typedef struct  {
   //just for sentUnackList
   int retryTime;
   long lastSentTime;
-
-  //just for bbr
-  int currentLastestAck;
-  bool appLimit;
 }buffer_t;
 #define BUFFER_SIZE 64
-#define ABNORMAL_RANGE 1.2
+
 
 /**
  * cTCP configuration struct.

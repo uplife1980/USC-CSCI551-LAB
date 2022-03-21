@@ -11,7 +11,7 @@
  *
  *****************************************************************************/
 
-#include "ctcp_bbr.h"
+#include "ctcp.h"
 #include "ctcp_linked_list.h"
 #include "ctcp_sys.h"
 #include "ctcp_utils.h"
@@ -24,7 +24,6 @@
  *
  * You should add to this to store other fields you might need.
  */
-
 struct ctcp_state {
   struct ctcp_state *next;  /* Next in linked list */
   struct ctcp_state **prev; /* Prev in linked list */
@@ -50,13 +49,6 @@ struct ctcp_state {
 
   //0--NO FIN, 1--prepare to send FIN 2--has sent FIN
   uint8_t prepareSendFINStatus;
-
-  //for bbr
-  long lastTouchMinRTTTime, lastTouchMaxBWTime;
-  uint32_t estimateBandWidth; // B/s
-  double gain;
-  long lastSentTime;
-  FILE *bdpFile;
 
 
 };
@@ -122,12 +114,6 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->prepareSendFINStatus = 0;
   state->singleACKUpdate = false;
 
-  state->lastSentTime = state->lastTouchMinRTTTime = state->lastTouchMaxBWTime = current_time();
-  state->estimateBandWidth = 1000;
-  state->gain = 1.1;
-  state->bdpFile = fopen("log.txt", "a+");
-  
-
   return state;
 }
 
@@ -174,108 +160,6 @@ void ctcp_destroy(ctcp_state_t *state) {
   end_client();
 }
 
-uint32_t getBBRLimit(ctcp_state_t *state)
-{
-    long currentTime = current_time();
-    int bdp = state->estimateBandWidth * state->rtt;
-    char tempString [255];
-    int endPos = sprintf(tempString, "%ld", currentTime);
-    tempString[endPos++] = ',';
-    sprintf(&(tempString[endPos]), "%d", bdp);
-    fprintf(state->bdpFile, "%s", tempString);
-    if(state->inflightData >= bdp * state->gain)
-    {
-        return 0;
-    }
-
-    long waitTime = currentTime - state->lastSentTime;
-    return state->gain * waitTime * state->estimateBandWidth / 1000;
-}
-
-void updateBBR(ctcp_state_t *state, ctcp_segment_t *segment)
-{
-    //uint16_t seglen = ntohs(segment->len);
-    uint32_t ackno = ntohl(segment->ackno);
-    //uint32_t seqno = ntohl(segment->seqno);
-    long currentTime = current_time();
-
-    //find the max seqNum < ackno in sentUnackList
-    ll_node_t *bufNode = ll_back(state->sentUnackList);
-    while(bufNode)
-    {
-        buffer_t *buf = (buffer_t*)(bufNode->object);
-        uint32_t currentSeqNumInNetOrder = ((ctcp_segment_t*)(buf->data))->seqno;
-        if( ntohl(currentSeqNumInNetOrder) < ackno)
-        {
-            break;
-        }
-        bufNode = bufNode->prev;
-    }
-
-    if(!bufNode)
-        return;
-    buffer_t *buf = (buffer_t*)(bufNode->object);
-    //we cannot use retry packet.
-    if(buf->retryTime)
-        return;
-
-    int currentRTT = currentTime - buf->lastSentTime;
-
-    //update RTT
-    do
-    {
-        //good news! lower rtt!
-        if(currentRTT < state->rtt)
-        {
-            state->rtt = currentRTT;
-            state->lastTouchMinRTTTime = currentTime;
-        }
-
-        //over 120% * minRTT, need to do something!
-        if(currentRTT > state->rtt * ABNORMAL_RANGE){
-            state->gain = 0.9;
-        }
-        // still operate good, we can add more!
-        else
-        {
-            state->gain = 1.1;
-        }
-
-        //outdated, forced to update min RTT
-        if((currentTime - state->lastTouchMinRTTTime > 10*1000))
-        {
-            state->rtt = currentRTT;
-            state->lastTouchMinRTTTime = currentTime;
-        }
-
-    } while (0);
-
-    //update BW
-    do
-    {
-
-        int currentAckedAmount = ackno - buf->currentLastestAck;
-        if(currentAckedAmount == 0)
-            break;
-        
-        uint32_t currentBW = currentAckedAmount / currentRTT * 1000;
-
-        //BW goes up
-        if(currentBW > state->estimateBandWidth * ABNORMAL_RANGE)
-        {
-            state->estimateBandWidth = currentBW;
-            // still operate good, we can add more!
-            state->gain = state->gain <= 1.1? 1.1:(state->gain);
-        }
-        //bw too low
-        else if(!buf->appLimit &&  currentBW * ABNORMAL_RANGE < state->estimateBandWidth)
-        {
-            state->estimateBandWidth = currentBW;
-            state->gain = 0.9;
-        }
-    } while (0);
-    
-}
 
 void trySend(ctcp_state_t *state)
 {
@@ -306,12 +190,7 @@ void trySend(ctcp_state_t *state)
 
 
   /*decide how much to send*/
-  //decision from unsentList
   int dataLen = MAX_SEG_DATA_SIZE > totalUnsentLen? totalUnsentLen: MAX_SEG_DATA_SIZE;
-  //decision from bbr
-  int bbrRes = getBBRLimit(state);
-  dataLen = dataLen > bbrRes ? bbrRes : dataLen;
-  //decision from sendWindow
   uint16_t limitBySendWindow = (state->sendWindow - state->inflightData >= 0)? (state->sendWindow - state->inflightData): 0;
   if(limitBySendWindow == 0)
   {
@@ -375,7 +254,6 @@ void trySend(ctcp_state_t *state)
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
 
   state->seqNum += dataLen;
-  state->lastSentTime = current_time();
 
   //backupData
   if(shouldInsertToUnackList)
@@ -384,11 +262,6 @@ void trySend(ctcp_state_t *state)
     unackedBuf->usedLen = 0;
     unackedBuf->lastSentTime = current_time();
     unackedBuf->retryTime = 0;
-    unackedBuf->currentLastestAck = state->lastAckedSeq;
-    if(dataLen < bbrRes)
-        unackedBuf->appLimit = true;
-    else
-        unackedBuf->appLimit = false;
     ll_add(state->sentUnackList, unackedBuf);
     unackedBuf->data = (char*)segment;
     unackedBuf->len = sizeof(ctcp_segment_t) + dataLen;
@@ -462,7 +335,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     return;    
   }
 
-  updateBBR(state, segment);
   /*adjust ACK number*/
   state->ackNum += seglen - sizeof(ctcp_segment_t);
   state->sendWindow = ntohs(segment->window);

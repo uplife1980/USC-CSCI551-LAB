@@ -6,9 +6,9 @@ TAR = ctcp.tar.gz
 SUBMISSION_SITE = https://web.stanford.edu/class/cs144/cgi-bin/submit/
 
 # Add any header files you've added here.
-HDRS = ctcp_linked_list.h ctcp_utils.h ctcp.h ctcp_sys.h ctcp_sys_internal.h ctcp_bbr.h
+HDRS = ctcp_linked_list.h ctcp_utils.h ctcp.h ctcp_sys.h ctcp_sys_internal.h 
 # Add any source files you've added here.
-SRCS = ctcp_linked_list.c ctcp_utils.c ctcp.c ctcp_sys_internal.c ctcp_bbr.c
+SRCS = ctcp_linked_list.c ctcp_utils.c ctcp.c ctcp_sys_internal.c 
 OBJS = $(patsubst %.c,%.o,$(SRCS))
 DEPS = $(patsubst %.c,.%.d,$(SRCS))
 
@@ -35,4 +35,4 @@ submit: clean
 	@echo
 
 clean:
-	rm -f .*.d *.o $(TAR) *~ ctcp *.csv core
+	rm -f .*.d *.o $(TAR) *~ ctcp *.csv core log.txt output.txt random* output dst*
