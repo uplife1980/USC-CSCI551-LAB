@@ -298,6 +298,17 @@ void ctcp_read(ctcp_state_t *state) {
     if(resLen == -1)
     {
       state->prepareSendFINStatus |= 1;
+      buf->len = 1;
+      while(buf->len != BUFFER_SIZE && buf->data[buf->len - 1] != 0xFF)
+      {
+        buf->len++;
+      }
+      if(buf->len != BUFFER_SIZE)
+      {
+        ll_add(state->unsentList, buf);
+        buf = NULL;
+      }
+
       break;
     }
     buf->len = resLen;
@@ -370,7 +381,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   {
     if(seglen - sizeof(ctcp_segment_t) == 0)
       state->ackNum++;
-    conn_output(state->conn, NULL, 0);
     state->stopRecv = true;
   }
 
@@ -397,6 +407,11 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
 }
 
 void ctcp_output(ctcp_state_t *state) {
+  if(state->stopRecv && ll_length(state->unsubmitedList) == 0)
+  {
+      conn_output(state->conn, NULL, 0);
+      return;
+  }
   size_t availableSize = conn_bufspace(state->conn);
   uint16_t hasOutputCount = 0;
   while(availableSize && ll_length(state->unsubmitedList))
