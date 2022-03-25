@@ -90,11 +90,12 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 
   if(!(state->unsentList && state->sentUnackList && state->unsubmitedList))
   {
-    ctcp_destroy(state);
+    
     free(state->unsentList);
     free(state->sentUnackList);
     free(state->unsubmitedList);
     free(cfg);
+    ctcp_destroy(state);
     return NULL;
   }
 
@@ -417,7 +418,6 @@ void trySend(ctcp_state_t *state)
   segment->seqno = htonl(state->seqNum);
   segment->ackno = htonl(state->ackNum);
   segment->len = htons(sizeof(ctcp_segment_t) + dataLen);
-  //fprintf(stderr, "I sent %d \n", (int)ntohs((segment->len)));
   segment->flags = 0;
   segment->flags |= TH_ACK;
   state->singleACKUpdate = false;
@@ -513,7 +513,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   uint32_t ackno = ntohl(segment->ackno);
   uint32_t seqno = ntohl(segment->seqno);
 
-  if(cksum((void*)segment, seglen) != 0xffff || (len < seglen))
+  if(/*cksum((void*)segment, seglen) != 0xffff || */(len < seglen))
   {
     
     //fprintf(stderr, "invaild checksum=%d, segLen=%d, len=%d\n", cksum((void*)segment, seglen), (int)seglen, (int)len);
@@ -524,7 +524,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   // I need former packet
   if(seqno != state->ackNum)
   {
-    //fprintf(stderr, "invalid seqNum, I need %d, but get %d \n", (int)(state->ackNum), seqno);
     state->singleACKUpdate = true;
     free(segment);
     trySend(state);
@@ -535,7 +534,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   updateBBR(state, segment);
   /*adjust ACK number*/
   state->ackNum += seglen - sizeof(ctcp_segment_t);
-  //fprintf(stderr, "acked to %d \n", (int)(state->ackNum));
   state->sendWindow = ntohs(segment->window);
 
   if(seglen - sizeof(ctcp_segment_t) != 0 || (segment->flags & TH_FIN))
@@ -570,7 +568,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   {
     if(seglen - sizeof(ctcp_segment_t) == 0)
       state->ackNum++;
-    conn_output(state->conn, NULL, 0);
     state->stopRecv = true;
   }
 
@@ -597,6 +594,11 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
 }
 
 void ctcp_output(ctcp_state_t *state) {
+    if(state->stopRecv && ll_length(state->unsubmitedList) == 0)
+    {
+        conn_output(state->conn, NULL, 0);
+        return;
+    }
   size_t availableSize = conn_bufspace(state->conn);
   uint16_t hasOutputCount = 0;
   while(availableSize && ll_length(state->unsubmitedList))
@@ -649,7 +651,7 @@ void ctcp_timer() {
     {
       buffer_t* buf = bufObj->object;
       long currentTime = current_time();
-      if(currentTime - buf->lastSentTime > currentState->rtt)
+      if(currentTime - buf->lastSentTime > currentState->rtt*2)
       {
           ctcp_segment_t *segment = (ctcp_segment_t*)(buf->data);
           if(buf->retryTime == 4)
