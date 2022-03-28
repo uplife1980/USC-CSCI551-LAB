@@ -167,6 +167,7 @@ void ctcp_destroy(ctcp_state_t *state) {
   free(state);
   end_client();
   fprintf(stderr, "destroy!!\n");
+  fflush(stderr);
 
 }
 
@@ -201,10 +202,12 @@ void trySend(ctcp_state_t *state)
 
 
   /*decide how much to send*/
-  uint32_t bbr_limit = bbr_thisTimeSend(state->bbr_status, state->seqNum !=1);
+  uint32_t bbr_limit_pacing = bbr_thisTimeSendPacing(state->bbr_status, state->seqNum !=1);
+  uint32_t bbr_limit_cwnd = bbr_thisTimeSendCwnd(state->bbr_status);
   uint32_t dataLen = MAX_SEG_DATA_SIZE > totalUnsentLen? totalUnsentLen: MAX_SEG_DATA_SIZE;
   dataLen = dataLen > state->sendWindow?  state->sendWindow: dataLen;
-  dataLen = dataLen > bbr_limit? bbr_limit: dataLen;
+  dataLen = dataLen > bbr_limit_pacing? bbr_limit_pacing: dataLen;
+  dataLen = dataLen > bbr_limit_cwnd? bbr_limit_cwnd: dataLen;
   if(!dataLen && !(state->prepareSendFINStatus ==1 ))
   {
     shouldInsertToUnackList = false;
@@ -264,8 +267,9 @@ void trySend(ctcp_state_t *state)
   segment->cksum = cksum((void*)segment, sizeof(ctcp_segment_t) + dataLen);
 
   state->seqNum += dataLen;
+  bbr_sentNotice(state->bbr_status, dataLen, (dataLen < bbr_limit_pacing));
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
-
+  
 
 
   //backupData
@@ -275,17 +279,20 @@ void trySend(ctcp_state_t *state)
     unackedBuf->usedLen = 0;
     unackedBuf->lastSentTime = currentTime;
     unackedBuf->retryTime = 0;
-    unackedBuf->currentLastestAck = state->ackNum;
-    unackedBuf->appLimit = (dataLen < bbr_limit)? true:false;
+    unackedBuf->appLimit = (dataLen < bbr_limit_pacing)? true:false;
     ll_add(state->sentUnackList, unackedBuf);
     unackedBuf->data = (char*)segment;
     unackedBuf->len = sizeof(ctcp_segment_t) + dataLen;
+
+    buffer_t *firstBuf = ll_front(state->sentUnackList)->object;
+    ctcp_segment_t *firstSeg = (ctcp_segment_t *)(firstBuf->data);
+    unackedBuf->currentLastestAck = ntohl(firstSeg->seqno) - 1;
+    
     if((state->prepareSendFINStatus & 1) && dataLen == 0)
     {
       unackedBuf->len++;
     }
     state->inflightPacket ++;
-    bbr_sentNotice(state->bbr_status, dataLen, unackedBuf->appLimit);
   }
   else
   {
@@ -387,7 +394,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     {
       ack_sample_t sample = {
         .app_limit = buf->appLimit,
-        .ackedDataCount = ackno - buf->currentLastestAck,
+        .ackedDataCount = ackno - buf->currentLastestAck - 1,
         .timestamp = currentTime,
         .isRetried = buf->retryTime > 0?1:0,
         .estimateRTT = currentTime - buf->lastSentTime,
