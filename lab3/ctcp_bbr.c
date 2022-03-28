@@ -1,192 +1,377 @@
-/******************************************************************************
- * ctcp.c
- * ------
- * Implementation of cTCP done here. This is the only file you need to change.
- * Look at the following files for references and useful functions:
- *   - ctcp.h: Headers for this file.
- *   - ctcp_iinked_list.h: Linked list functions for managing a linked list.
- *   - ctcp_sys.h: Connection-related structs and functions, cTCP segment
- *                 definition.
- *   - ctcp_utils.h: Checksum computation, getting the current time.
- *
- *****************************************************************************/
-
 #include "ctcp_bbr.h"
-#include "ctcp_linked_list.h"
-#include "ctcp_sys.h"
-#include "ctcp_utils.h"
-#define DEBUG
+static const double bbr_high_gain = 2.88;
+static const double bbr_drain_gain = 1.0/2.88;
+static const double bbr_cwnd_gain_for_probe_bw = 2.0;
+static const double bbr_probe_bw_pacing_gain[] = {5.0/4.0, 3.0/4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+static const int bbr_cycle_size = 8;
 
-/**
- * Connection state.
- *
- * Stores per-connection information such as the current sequence number,
- * unacknowledged packets, etc.
- *
- * You should add to this to store other fields you might need.
- */
-struct ctcp_state {
-  struct ctcp_state *next;  /* Next in linked list */
-  struct ctcp_state **prev; /* Prev in linked list */
+static const int bbr_keep_in_flight_packet = 4;
+static const double bbr_full_bw_threshold = 1.25;
+static const int bbr_full_bw_count = 3;
 
-  conn_t *conn;             /* Connection object -- needed in order to figure
-                               out destination when sending */
-  linked_list_t *unsentList, *sentUnackList, *unsubmitedList;  
-  /* Linked list of segments sent to this connection.
-                               It may be useful to have multiple linked lists
-                               for unacknowledged segments, segments that
-                               haven't been sent, etc. Lab 1 uses the
-                               stop-and-wait protocol and therefore does not
-                               necessarily need a linked list. You may remove
-                               this if this is the case for you */
+static const int bbr_bw_sample_expire_period_ms = 500;
+static const int bbr_rtt_expire_period_ms = 10*1000;
+static const int bbr_probe_rtt_lasting_time_ms = 100;
 
-  uint16_t sendWindow, recvWindow;
-  uint16_t inflightData;
-  int rtt;
-  int timer;
-  uint32_t seqNum, ackNum, lastAckedSeq;
-  bool stopRecv; //I received FIN from peer
-  bool singleACKUpdate; //No data to send, just ACK empty packet
+uint32_t get_max_maxQueue(maxQueue_t* q)
+{
+  return q->sample[0].bw;
+}
 
-  //0--NO FIN, 1--prepare to send FIN 2--has sent FIN
-  uint8_t prepareSendFINStatus;
+uint32_t reset_maxQueue(maxQueue_t* q, bw_record_t rec)
+{
+  q->sample[0] = rec;
+  q->sample[1] = q->sample[2] = q->sample[0];
+  return q->sample[0].bw;
+}
 
-  //for bbr
-  long lastTouchMinRTTTime, lastTouchMaxBWTime;
-  uint32_t estimateBandWidthBs; // B/s
-  double gain;
-  long lastSentTime;
-  FILE *bdpFile;
-
-
-};
-
-/**
- * Linked list of connection states. Go through this in ctcp_timer() to
- * resubmit segments and tear down connections.
- */
-static ctcp_state_t *state_list;
-
-
-ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
-  /* Connection could not be established. */
-  if (conn == NULL) {
-    return NULL;
-  }
-
-  /* Established a connection. Create a new state and update the linked list
-     of connection states. */
-  ctcp_state_t *state = calloc(sizeof(ctcp_state_t), 1);
-  if(!state)
+//need repair in the future (https://code.woboq.org/linux/linux/lib/win_minmax.c.html#minmax_running_max)
+uint32_t insert_data_maxQueue(maxQueue_t *q, bw_record_t rec)
+{
+  if(rec.timestamp - q->sample[0].timestamp > bbr_bw_sample_expire_period_ms)
   {
-    free(cfg);
-    return NULL;
+    q->sample[0] = q->sample[1];
   }
-    
-
-  state->unsentList = calloc(sizeof(linked_list_t), 1);
-  state->sentUnackList = calloc(sizeof(linked_list_t), 1);
-  state->unsubmitedList = calloc(sizeof(linked_list_t), 1);
-
-  if(!(state->unsentList && state->sentUnackList && state->unsubmitedList))
+  if(q->sample[1].bw < rec.bw || rec.timestamp - q->sample[1].timestamp > bbr_bw_sample_expire_period_ms / 4)
   {
-    
-    free(state->unsentList);
-    free(state->sentUnackList);
-    free(state->unsubmitedList);
-    free(cfg);
-    ctcp_destroy(state);
-    return NULL;
+    q->sample[2] = q->sample[1];
+    q->sample[1] = rec;
   }
 
+  if(rec.timestamp - q->sample[1].timestamp > bbr_bw_sample_expire_period_ms / 2)
+  {
+    q->sample[2] = q->sample[1];
+  }
 
-  state->next = state_list;
-  state->prev = &state_list;
-  if (state_list)
-    state_list->prev = &state->next;
-  state_list = state;
+  return q->sample[0].bw;
+}
 
-  /* Set fields. */
-  state->conn = conn;
-  
-  state->recvWindow = cfg->recv_window;
-  state->sendWindow = cfg->send_window;
-  state->rtt = cfg->rt_timeout;
-  state->timer = cfg->timer;
-  free(cfg);
 
-  state->seqNum = 1;
-  state->ackNum = 1;
-  state->lastAckedSeq = 1;
-  state->inflightData = 0;
-  state->stopRecv = false;
-  state->prepareSendFINStatus = 0;
-  state->singleACKUpdate = false;
 
-  state->lastSentTime = state->lastTouchMinRTTTime = state->lastTouchMaxBWTime = current_time();
-  state->estimateBandWidthBs = state->sendWindow;
-  state->gain = 1.1;
+void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sendWindw)
+{
+  long currentTime = current_time();
+
+  if(!bbr)
+    return;
+  //file
   char temp[255]="random";
-  srand((unsigned int)state->lastSentTime);
+  srand((unsigned int)currentTime);
   sprintf(temp+6, "%d", rand());
-  state->bdpFile = fopen(temp, "a+");
+  bbr->bdpFile = fopen(temp, "a+");
+
+  bbr->have_gotten_rtt_sample = false;
+  //bbr->idle_restart = false;
+
+  bbr->inflightData = 0;
+  bbr->lastSentTime = currentTime;
+
+  bbr->have_gotten_rtt_sample = false;
+  bbr->min_rtt_ms = min_rtt_estimate;
+  bbr->min_rtt_timestamp = currentTime;
+  bbr->time_to_stop_probe_rtt = currentTime;
+  bbr->probe_rtt_done = true;
+  //bbr->rtt_count = 0;
+  //bbr->next_round_have_gotten_acked = 1;
+
+  bbr->cycle_timestamp = currentTime;
+  bbr->cycle_index = 0;
+  bbr->current_phase = STARTUP;
+
+  bbr->bw_sample_queue.sample[0].bw = 0;
+  bbr->bw_sample_queue.sample[1] = bbr->bw_sample_queue.sample[2] = bbr->bw_sample_queue.sample[0];
+  bbr->reached_full_bw = false;
+  bbr->reached_full_bw_count = 0;
   
 
-  return state;
+  bbr->pacing_gain = bbr_high_gain;
+  bbr->cwnd_gain = bbr_high_gain;
+  bbr->current_cwnd = default_sendWindw;
+  bbr->prior_cwnd = default_sendWindw;
+
+  bbr->full_bw = bbr->current_cwnd * 1000 / bbr->min_rtt_ms;
+
+  bbr->applimit_left = 0;
+
 }
 
-void cleanBuffer(buffer_t *buffer)
+void clean_bbr(bbr_status_t *bbr)
 {
-  if(!buffer)
+  if(!bbr)
     return;
-    
-  free(buffer->data);
-  free(buffer);
+  
+  fclose(bbr->bdpFile);
 }
 
-void cleanBufferList(linked_list_t* list)
+void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
 {
-  if(!list)
-    return;
+  //record the lastest sample bw, but don't update full bw: we will do that in update_check_full_bw()
 
-  ll_node_t *p = ll_front(list);
-  while(p)
+  uint32_t bw = sample->ackedDataCount *1000 / sample->estimateRTT;
+  bbr->round_start = 1;
+  bbr->inflightData -= sample->ackedDataCount;
+
+  if(!sample->app_limit || bw >= get_max_maxQueue(&(bbr->bw_sample_queue)) )
   {
-    void *obj = ll_remove(list, p);
-    cleanBuffer((buffer_t *)obj);
-    p = ll_front(list);
+    bw_record_t record = {
+    .bw = bw,
+    .timestamp = current_time()
+    };
+
+    insert_data_maxQueue(&(bbr->bw_sample_queue), record);
+  }
+}
+
+uint32_t calculate_bdp(bbr_status_t *bbr)
+{
+  return bbr->pacing_gain * bbr->min_rtt_ms * bbr->bw_sample_queue.sample[0].bw / 1000;
+}
+
+bool should_shift_to_next_cycle(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  bool has_waited_for_enough_time = (sample->timestamp - bbr->cycle_timestamp >= bbr->min_rtt_ms);
+
+  if(bbr->pacing_gain == 1.0)
+    return has_waited_for_enough_time;
+
+  else if(bbr->pacing_gain > 1.0)
+  {
+    return has_waited_for_enough_time && (bbr->inflightData >= calculate_bdp(bbr));
+  }
+  else 
+  {
+    //bbr->pacing_gain < 1.0
+    //because we are trying to drain the pipe, check if we achieve that goal
+    return has_waited_for_enough_time || bbr->inflightData < calculate_bdp(bbr);
+  }
+}
+
+void update_cycle(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  if(bbr->current_phase != PROBE_BW)
+    return;
+
+  if(should_shift_to_next_cycle(bbr, sample))
+  {
+    //shift to next cycle
+    bbr->cycle_index = (bbr->cycle_index + 1 ) % bbr_cycle_size;
+    bbr->cycle_timestamp = current_time();
+  }
+}
+
+void update_check_bw_full(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  if(bbr->reached_full_bw ||!bbr->round_start || sample->app_limit)
+    return;
+
+  uint32_t bw_expect = bbr->full_bw * bbr_full_bw_threshold;
+
+  if(get_max_maxQueue(&(bbr->bw_sample_queue)) > bw_expect)
+  {
+    //we can expect more
+    bbr->full_bw = get_max_maxQueue(&(bbr->bw_sample_queue));
+    bbr->reached_full_bw_count = 0;
+    return;
+  }
+  else
+  {
+    if(++bbr->reached_full_bw == bbr_full_bw_count)
+    {
+      bbr->reached_full_bw = true; //Once we reached, we never reset again.
+    }
+    return;
+  }  
+}
+
+void shift_to_probe_bw(bbr_status_t *bbr)
+{
+  bbr->current_phase = PROBE_BW;
+  bbr->cycle_index = rand() % bbr_cycle_size;
+  bbr->cycle_timestamp = current_time();
+}
+
+void shift_to_start_up(bbr_status_t *bbr)
+{
+  bbr->current_phase = STARTUP;
+}
+
+void reset_phase(bbr_status_t *bbr)
+{
+  if(!bbr->reached_full_bw)
+    shift_to_start_up(bbr);
+  else
+    shift_to_probe_bw(bbr);
+}
+
+void update_check_drain(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  if(bbr->current_phase == STARTUP && bbr->reached_full_bw)
+  {
+    bbr->current_phase = DRAIN;
+  }
+  if(bbr->current_phase == DRAIN)
+  {
+    if(bbr->inflightData < calculate_bdp(bbr))
+    {
+      shift_to_probe_bw(bbr);
+    }
+  }
+}
+
+void try_finish_probe_rtt(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  if(bbr->time_to_stop_probe_rtt && sample->timestamp > bbr->time_to_stop_probe_rtt)
+  {
+    bbr->min_rtt_timestamp = sample->timestamp;
+    bbr->current_cwnd = bbr->current_cwnd > bbr->prior_cwnd? bbr->current_cwnd :  bbr->prior_cwnd;
+    reset_phase(bbr);
   }
 
-
-  free(list);
 }
 
-void ctcp_destroy(ctcp_state_t *state) {
-  /* Update linked list. */
-  if (state->next)
-    state->next->prev = state->prev;
+void update_min_rtt(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  bool isExpired = (sample->timestamp - bbr->min_rtt_timestamp > bbr_rtt_expire_period_ms);
+  if(sample->estimateRTT < bbr->min_rtt_ms || isExpired)
+  {
+    bbr->min_rtt_ms = sample->estimateRTT;
+    bbr->min_rtt_timestamp = sample->timestamp;
+  }
 
-  *state->prev = state->next;
-  conn_remove(state->conn);
+  if(isExpired && bbr->current_phase != PROBE_RTT)
+  {
+    bbr->current_phase = PROBE_RTT;
+    bbr->prior_cwnd = bbr->current_cwnd;
+    bbr->probe_rtt_done = false;
+    bbr->time_to_stop_probe_rtt = 0;
+  }
 
-  cleanBufferList(state->unsentList);
-  cleanBufferList(state->sentUnackList);
-  cleanBufferList(state->unsubmitedList);
+  if(bbr->current_phase == PROBE_RTT)
+  {
+    bbr->applimit_left = bbr->inflightData? bbr->inflightData:1;
 
-  free(state);
-  end_client();
-  fclose(state->bdpFile);
+    if(!bbr->time_to_stop_probe_rtt && sample->packetInflight <= bbr_keep_in_flight_packet)
+    {
+      //make sure we don't push too many packet into the pipe.
+      bbr->time_to_stop_probe_rtt = sample->timestamp + bbr_probe_rtt_lasting_time_ms;
+      bbr->probe_rtt_done = false;
+    }
+    else if(bbr->time_to_stop_probe_rtt)
+    {
+      if(bbr->round_start)
+        bbr->probe_rtt_done = true;
+      
+      if(bbr->probe_rtt_done)
+        try_finish_probe_rtt(bbr, sample);
+    }
+  }
 }
 
-void printBDP(ctcp_state_t *state, int thisTimeSentData)
+void update_gain(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  switch(bbr->current_phase)
+  {
+    case STARTUP:
+      bbr->pacing_gain = bbr_high_gain;
+      bbr->cwnd_gain = bbr_high_gain;
+      break;
+
+    case DRAIN:
+      bbr->pacing_gain = bbr_drain_gain;
+      bbr->cwnd_gain = bbr_drain_gain;
+      break;
+
+    case PROBE_BW:
+      bbr->pacing_gain = bbr_probe_bw_pacing_gain[bbr->cycle_index];
+      bbr->cwnd_gain = bbr_cwnd_gain_for_probe_bw;
+      break;
+
+    case PROBE_RTT:
+      bbr->pacing_gain = 1.0;
+      bbr->cwnd_gain = 1.0;
+      break;
+  }
+  
+    
+  
+
+}
+
+uint32_t get_current_pacing(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  if(!bbr->have_gotten_rtt_sample)
+  {
+    return bbr->current_cwnd *1000 / bbr->min_rtt_ms;
+  }
+
+  return bbr->full_bw * bbr->pacing_gain;
+}
+
+void update_cwnd(bbr_status_t *bbr, ack_sample_t* sample)
+{
+  uint32_t expected_cwnd = calculate_bdp(bbr) * bbr->cwnd_gain;
+  bbr->current_cwnd += sample->ackedDataCount;
+
+  if(bbr->reached_full_bw)
+  {
+    bbr->current_cwnd = bbr->current_cwnd > expected_cwnd? expected_cwnd : bbr->current_cwnd; //use the smaller one 
+  }
+  else if(expected_cwnd > bbr->inflightData)
+  {
+    bbr->current_cwnd = expected_cwnd - bbr->inflightData;
+  }
+  else
+  {
+    bbr->current_cwnd = 4;
+  }
+
+  if(bbr->current_phase == PROBE_RTT)
+  {
+    bbr->current_cwnd = 4;
+  }
+}
+
+void bbr_update(bbr_status_t*bbr, ack_sample_t* sample)
+{
+  update_bw(bbr, sample);
+  update_cycle(bbr, sample);
+  update_check_bw_full(bbr, sample);
+  update_check_drain(bbr, sample);
+  update_min_rtt(bbr, sample);
+  update_gain(bbr, sample);
+  //update_pacing(bbr, sample);
+  update_cwnd(bbr, sample);
+
+}
+
+void bbr_retransmission_notice(bbr_status_t *bbr)
+{
+  bbr->current_cwnd = 4;
+}
+
+//for caller use
+uint32_t bbr_thisTimeSend(bbr_status_t *bbr)
+{
+  long time_dt_ms = current_time() - bbr->lastSentTime;
+  uint32_t dataFromPacing = time_dt_ms * bbr->full_bw * bbr->pacing_gain/ 1000;
+
+  return (dataFromPacing > bbr->current_cwnd)? bbr->current_cwnd : dataFromPacing;
+  
+}
+
+void bbr_sentNotice(bbr_status_t *bbr, uint32_t data_len, bool is_app_limit)
+{
+  bbr->inflightData += data_len;
+}
+
+
+void printBDP(bbr_status_t *bbr, ack_sample_t* sample)
 {
     long currentTime = current_time();
+    
     #ifndef DEBUG
-    int bdp = state->estimateBandWidthBs * state->rtt / 1000;
+    uint32_t bdp = calculate_bdp(bbr);
     #endif
-    char tempString [255];
-    int endPos = sprintf(tempString, "%ld", currentTime);
-    tempString[endPos++] = ',';
     #ifdef DEBUG
     endPos += sprintf(&(tempString[endPos]), "%d * ", (int)(state->estimateBandWidthBs));
     endPos += sprintf(&(tempString[endPos]), "%d = ", (int)(state->rtt));
@@ -196,491 +381,9 @@ void printBDP(ctcp_state_t *state, int thisTimeSentData)
     endPos += sprintf(&(tempString[endPos]), "%lf", (state->gain));
     tempString[endPos++] = ',';
     endPos += sprintf(&(tempString[endPos]), "%d", thisTimeSentData);
-    #else 
-    endPos += sprintf(&(tempString[endPos]), "%d", bdp*8);
+    
     #endif
-    tempString[endPos++] = '\n';
-    tempString[endPos] = '\0';
-    fprintf(state->bdpFile, "%s", tempString);
-    fflush(state->bdpFile);
-}
-
-uint32_t getBBRLimit(ctcp_state_t *state)
-{
-    long currentTime = current_time();
-    int bdp = state->estimateBandWidthBs * state->rtt / 1000;
-    if(state->inflightData >= bdp * state->gain)
-    {
-        return 0;
-    }
-
-    long waitTime = currentTime - state->lastSentTime;
-    return state->gain * waitTime/1000 * state->estimateBandWidthBs;
-}
-
-void updateBBR(ctcp_state_t *state, ctcp_segment_t *segment)
-{
-    //uint16_t seglen = ntohs(segment->len);
-    uint32_t ackno = ntohl(segment->ackno);
-    //uint32_t seqno = ntohl(segment->seqno);
-    long currentTime = current_time();
-
-    //find the max seqNum < ackno in sentUnackList
-    ll_node_t *bufNode = ll_back(state->sentUnackList);
-    while(bufNode)
-    {
-        buffer_t *buf = (buffer_t*)(bufNode->object);
-        uint32_t currentSeqNumInNetOrder = ((ctcp_segment_t*)(buf->data))->seqno;
-        if( ntohl(currentSeqNumInNetOrder) < ackno)
-        {
-            break;
-        }
-        bufNode = bufNode->prev;
-    }
-
-    if(!bufNode)
-        return;
-    buffer_t *buf = (buffer_t*)(bufNode->object);
-    //we cannot use retry packet.
-    if(buf->retryTime)
-        return;
-
-    int currentRTT = currentTime - buf->lastSentTime;
-    if(currentRTT == 0)
-      currentRTT = 1;
-
-    //update RTT
-    do
-    {
-        //over 120% * minRTT, need to do something!
-        if(currentRTT > state->rtt * ABNORMAL_RANGE){
-            state->gain = 0.9;
-            #ifdef DEBUG
-            fprintf(state->bdpFile, "[rtt update] terrible rtt: %d -> %d\n",state->rtt, currentRTT);
-            fflush(state->bdpFile);
-            #endif
-        }
-        // still operate good, we can add more!
-        else if(currentRTT * ABNORMAL_RANGE< state->rtt)
-        {
-            #ifdef DEBUG
-            fprintf(state->bdpFile, "[rtt update] good rtt: %d -> %d\n",state->rtt, currentRTT);
-            fflush(state->bdpFile);
-            #endif
-            state->rtt = currentRTT;
-            state->lastTouchMinRTTTime = currentTime;
-            state->gain = 1.1;
-            
-        }
-        else
-        {
-          state->gain = 1.1;
-          #ifdef DEBUG
-          fprintf(state->bdpFile, "[rtt update] rtt: %d -> %d\n",state->rtt, currentRTT);
-          fflush(state->bdpFile);
-          #endif
-        }
-
-        //outdated, forced to update min RTT
-        if(currentTime - state->lastTouchMinRTTTime > 10*1000)
-        {
-            #ifdef DEBUG
-            fprintf(state->bdpFile, "[rtt update] forced update rtt: %d -> %d\n",state->rtt, currentRTT);
-            fflush(state->bdpFile);
-            #endif
-            state->rtt = currentRTT;
-            state->lastTouchMinRTTTime = currentTime;
-            
-        }
-
-    } while (0);
-
-    //update BW
-    do
-    {
-        if(buf->appLimit)
-          break;
-        int currentAckedAmount = ackno - buf->currentLastestAck;
-        if(currentAckedAmount == 0)
-            break;
-        
-        if(currentRTT == 0)
-          break;
-        uint32_t currentBW = (double)currentAckedAmount / (double)currentRTT * 1000;
-
-        //BW goes up
-        if(currentBW > state->estimateBandWidthBs * ABNORMAL_RANGE)
-        {
-            #ifdef DEBUG
-            fprintf(state->bdpFile, "[bw update] bw up: %d -> %d\n",state->estimateBandWidthBs, currentBW);
-            fflush(state->bdpFile);
-            #endif
-            state->estimateBandWidthBs = currentBW;
-            // still operate good, we can add more!
-            state->gain = state->gain <= 1.1? 1.1:(state->gain);
-
-        }
-        //bw too low
-        else if(!buf->appLimit &&  currentBW * ABNORMAL_RANGE < state->estimateBandWidthBs)
-        {
-            #ifdef DEBUG
-            fprintf(state->bdpFile, "[bw update] bw down: %d -> %d\n",state->estimateBandWidthBs, currentBW);
-            fflush(state->bdpFile);
-            #endif
-            state->estimateBandWidthBs = currentBW;
-            state->gain = 0.9;
-
-        }
-    } while (0);
+    fprintf(bbr->bdpFile, "%ld, %d\n", currentTime, bdp*8);
+    fflush(bbr->bdpFile);
     
-}
-
-void trySend(ctcp_state_t *state)
-{
-  long currentTime = current_time();
-  ll_node_t *bufNode = ll_front(state->unsentList);
-  if(!bufNode && !(state->prepareSendFINStatus == 1) && !state->singleACKUpdate)
-    return;
-  
-
-  bool shouldInsertToUnackList = true;
-  if(!bufNode && (state->prepareSendFINStatus !=1 ))
-    shouldInsertToUnackList = false;
-  
-  uint32_t totalUnsentLen = 0;
-
-  if(bufNode)
-  {
-     /*calculate all unsentData Length*/
-      buffer_t *buf = bufNode->object;
-      totalUnsentLen = buf->len - buf->usedLen;
-      while(bufNode->next)
-      {
-        bufNode = bufNode->next;
-        buf = bufNode->object;
-        totalUnsentLen += buf->len - buf->usedLen;
-      }
-  }
- 
-
-
-  /*decide how much to send*/
-  //decision from unsentList
-  int dataLen = MAX_SEG_DATA_SIZE > totalUnsentLen? totalUnsentLen: MAX_SEG_DATA_SIZE;
-  //decision from bbr
-  int bbrRes = getBBRLimit(state);
-  dataLen = dataLen > bbrRes ? bbrRes : dataLen;
-  //decision from sendWindow
-  uint16_t limitBySendWindow = (state->sendWindow - state->inflightData >= 0)? (state->sendWindow - state->inflightData): 0;
-  dataLen = dataLen > limitBySendWindow? limitBySendWindow: dataLen;
-
-  if(dataLen == 0)
-  {
-    shouldInsertToUnackList = false;
-  }
-  else
-  {
-    printBDP(state, dataLen < bbrRes? 0: bbrRes);
-  }
-
-  int pos = 0;
-  ctcp_segment_t *segment = malloc(sizeof(ctcp_segment_t) + dataLen);
-  char *data = segment->data;
-
-  
-  
-  int originDataLen = dataLen;
-  while(dataLen)
-  {
-    bufNode = ll_front(state->unsentList);
-    buffer_t* buf = (buffer_t*)(bufNode->object);
-
-    if(dataLen >= buf->len - buf->usedLen)
-    {
-      memcpy(data+pos, buf->data+buf->usedLen, buf->len - buf->usedLen);
-      pos += buf->len - buf->usedLen;
-      dataLen -= buf->len - buf->usedLen;
-
-      ll_remove(state->unsentList, bufNode);
-      cleanBuffer(buf);
-    }
-    else
-    {
-      memcpy(data+pos, buf->data+buf->usedLen, dataLen);
-      buf->usedLen += dataLen;   
-
-      pos += dataLen;
-      dataLen = 0;
-    }
-  }
-  dataLen = originDataLen;
-  
-  segment->seqno = htonl(state->seqNum);
-  segment->ackno = htonl(state->ackNum);
-  segment->len = htons(sizeof(ctcp_segment_t) + dataLen);
-  segment->flags = 0;
-  segment->flags |= TH_ACK;
-  state->singleACKUpdate = false;
-  
-  if(totalUnsentLen == dataLen && (state->prepareSendFINStatus == 1))
-  {
-    segment->flags |= TH_FIN;
-    state->prepareSendFINStatus |= 2;
-    if(dataLen == 0)
-    {
-      state->seqNum ++;
-    }
-  }
-  
-  segment->window = htons(state->recvWindow);
-  segment->cksum = 0;
-
-  segment->cksum = cksum((void*)segment, sizeof(ctcp_segment_t) + dataLen);
-
-  state->seqNum += dataLen;
-  state->lastSentTime = currentTime;
-
-
-  conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
-
-  
-
-  //backupData
-  if(shouldInsertToUnackList)
-  {
-    buffer_t *unackedBuf = malloc(sizeof(buffer_t));
-    unackedBuf->usedLen = 0;
-    unackedBuf->lastSentTime = currentTime;
-    unackedBuf->retryTime = 0;
-    unackedBuf->currentLastestAck = state->lastAckedSeq;
-    if(dataLen < bbrRes)
-        unackedBuf->appLimit = true;
-    else
-        unackedBuf->appLimit = false;
-    ll_add(state->sentUnackList, unackedBuf);
-    unackedBuf->data = (char*)segment;
-    unackedBuf->len = sizeof(ctcp_segment_t) + dataLen;
-    if((state->prepareSendFINStatus & 1) && dataLen == 0)
-    {
-      unackedBuf->len++;
-    }
-    state->inflightData += dataLen;
-  }
-  else
-  {
-    free(segment);
-  }
-
-  //Switch prepareSendFINStatus to 2
-  if(state->prepareSendFINStatus & 1)
-  {
-    state->prepareSendFINStatus -= 1;
-  }
-  
-  
-}
-
-
-void ctcp_read(ctcp_state_t *state) {
- 
-  buffer_t *buf;
-  do{
-    buf = calloc(sizeof(buffer_t), 1);
-    buf->len = BUFFER_SIZE;
-    buf->data = malloc(BUFFER_SIZE);
-    buf->usedLen = 0;
-
-    int resLen = conn_input(state->conn, buf->data, buf->len);
-    if(resLen == -1)
-    {
-      state->prepareSendFINStatus |= 1;
-      break;
-    }
-    buf->len = resLen;
-    if(buf->len > 0)
-      ll_add(state->unsentList, buf);  
-  }while(buf->len > 0);
-  
-  cleanBuffer(buf);
-  
-  //trySend(state);
-  
-
-}
-
-void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
-  uint16_t seglen = ntohs(segment->len);
-  uint32_t ackno = ntohl(segment->ackno);
-  uint32_t seqno = ntohl(segment->seqno);
-
-  if(/*cksum((void*)segment, seglen) != 0xffff || */(len < seglen))
-  {
-    
-    //fprintf(stderr, "invaild checksum=%d, segLen=%d, len=%d\n", cksum((void*)segment, seglen), (int)seglen, (int)len);
-    free(segment);
-    return;
-  }
-
-  // I need former packet
-  if(seqno != state->ackNum)
-  {
-    state->singleACKUpdate = true;
-    free(segment);
-    trySend(state);
-    return;    
-  }
-
-
-  updateBBR(state, segment);
-  /*adjust ACK number*/
-  state->ackNum += seglen - sizeof(ctcp_segment_t);
-  state->sendWindow = ntohs(segment->window);
-
-  if(seglen - sizeof(ctcp_segment_t) != 0 || (segment->flags & TH_FIN))
-    state->singleACKUpdate = true;
-
- //This is an ack packet I've seen.
-  if(ackno < state->lastAckedSeq)
-    return;
-  int ackedDataLen = ackno - state->lastAckedSeq;
-  state->lastAckedSeq =  ackno;
-
-  state->inflightData -= ackedDataLen;
-
-  //delete sentUnackList's object
-  //Also, FIN packet's len == 1, but it's an empty segment.
-  while(ackedDataLen > 0)
-  {
-    ll_node_t *bufNode = ll_front(state->sentUnackList);
-    buffer_t* buf = ((buffer_t*)(bufNode->object));
-    
-    ackedDataLen -= buf->len - sizeof(ctcp_segment_t);
-    
-    ll_remove(state->sentUnackList, bufNode);
-    cleanBuffer(buf);  
-  }
-  
-  /*adjust recvWindow*/
-  state->recvWindow -= seglen - sizeof(ctcp_segment_t);
-
-  //deal with FIN
-  if(segment->flags & TH_FIN)
-  {
-    if(seglen - sizeof(ctcp_segment_t) == 0)
-      state->ackNum++;
-    state->stopRecv = true;
-  }
-
-  //prepare to submit peer's data
-  buffer_t *buf = calloc(sizeof(buffer_t), 1);
-  buf->len = seglen - sizeof(ctcp_segment_t);
-  buf->data = malloc(buf->len);
-  memcpy(buf->data, segment->data, buf->len);
-
-  if(buf->len)
-  {
-    ll_add(state->unsubmitedList, buf);
-  }
-  else
-  {
-    cleanBuffer(buf);
-  }
-
-  free(segment);
-  trySend(state);
-  ctcp_output(state);
-  
-
-}
-
-void ctcp_output(ctcp_state_t *state) {
-    if(state->stopRecv && ll_length(state->unsubmitedList) == 0)
-    {
-        conn_output(state->conn, NULL, 0);
-        return;
-    }
-  size_t availableSize = conn_bufspace(state->conn);
-  uint16_t hasOutputCount = 0;
-  while(availableSize && ll_length(state->unsubmitedList))
-  {
-    ll_node_t *bufNode = ll_front(state->unsubmitedList);
-    buffer_t *buf = bufNode->object;
-    if(availableSize >= buf->len - buf->usedLen)
-    {
-      conn_output(state->conn, buf->data+buf->usedLen, buf->len - buf->usedLen);
-      ll_remove(state->unsubmitedList, bufNode);
-      
-      hasOutputCount += buf->len - buf->usedLen;
-      cleanBuffer(buf);
-      break;
-    }
-    else
-    {
-      conn_output(state->conn, buf->data + buf->usedLen, availableSize);
-      buf->usedLen += availableSize;
-      hasOutputCount += availableSize;
-    }
-  }
-  bool needTellSenderZeroWindow = false;
-  if(state->recvWindow == 0)
-  {
-    needTellSenderZeroWindow = true;
-  }
-  state->recvWindow += hasOutputCount;
-  if(needTellSenderZeroWindow)
-  {
-    state->singleACKUpdate = true;
-    trySend(state);
-  }
-  
-}
-
-void ctcp_timer() {
-
-  ctcp_state_t *currentState = state_list;
-  while(currentState)
-  {
-    trySend(currentState);
-    ll_node_t *bufObj = ll_front(currentState->sentUnackList);
-    bool shouldDestroy = false;
-    if(!bufObj && (currentState->prepareSendFINStatus & 2) && currentState->stopRecv)
-    {
-      shouldDestroy = true;
-    }
-    while(bufObj)
-    {
-      buffer_t* buf = bufObj->object;
-      long currentTime = current_time();
-      if(currentTime - buf->lastSentTime > currentState->rtt*2)
-      {
-          ctcp_segment_t *segment = (ctcp_segment_t*)(buf->data);
-          if(buf->retryTime == 4)
-          {
-            shouldDestroy = true;
-            break;
-          }
-
-          
-
-          conn_send(currentState->conn, segment ,buf->len);
-
-          buf->lastSentTime = currentTime;
-          buf->retryTime++;
-
-      }
-      bufObj = bufObj->next;
-    }
-    if(shouldDestroy)
-    {
-      ctcp_state_t *tempState = currentState;
-      currentState = currentState->next;
-      ctcp_destroy(tempState);
-    }
-    else
-    {
-      currentState = currentState->next;
-    }
-    
-  }
-  
 }

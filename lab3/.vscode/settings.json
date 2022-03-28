@@ -1,6 +1,9 @@
 {
     "C_Cpp.errorSquiggles": "Enabled",
     "files.associations": {
-        "ctcp_sys.h": "c"
+        "ctcp_sys.h": "c",
+        "ctcp.h": "c",
+        "stdbool.h": "c",
+        "ctcp_bbr.h": "c"
     }
 }

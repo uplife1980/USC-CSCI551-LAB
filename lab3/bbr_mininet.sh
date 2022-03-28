@@ -38,13 +38,13 @@ echo "Starting server1"
 tmux new -s server1 -d 
 tmux send -t server1 "sudo ./go_to.sh server1" ENTER
 tmux send -t server1 "cd $HOME_FOLDER/lab3" ENTER 
-tmux send -t server1 "sudo ./ctcp -m -l -s -w 40 -p $SERVER1_PORT > $DST_FILE1" ENTER
+tmux send -t server1 "sudo ./ctcp -m -s -w 40 -p $SERVER1_PORT > $DST_FILE1" ENTER
 
 echo "Starting server2"
 tmux new -s server2 -d 
 tmux send -t server2 "sudo ./go_to.sh server2" ENTER
 tmux send -t server2 "cd $HOME_FOLDER/lab3" ENTER 
-tmux send -t server2 "sudo ./ctcp -l -m -s -w 40 -p $SERVER2_PORT > $DST_FILE2" ENTER
+tmux send -t server2 "sudo ./ctcp -m -s -w 40 -p $SERVER2_PORT > $DST_FILE2" ENTER
 
 sleep 5 
 
@@ -52,7 +52,7 @@ echo "Starting client1"
 tmux new -s client1 -d 
 tmux send -t client1 "sudo ./go_to.sh client1" ENTER
 tmux send -t client1 "cd $HOME_FOLDER/lab3" ENTER
-tmux send -t client1 "sudo ./ctcp -l -m -c $SERVER1_IP:$SERVER1_PORT -p $CLIENT1_PORT < $SRC_FILE1" ENTER
+tmux send -t client1 "sudo ./ctcp -m -l -c $SERVER1_IP:$SERVER1_PORT -p $CLIENT1_PORT < $SRC_FILE1" ENTER
 
 echo "Starting client2"
 tmux new -s client2 -d 
