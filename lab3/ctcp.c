@@ -119,7 +119,8 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->singleACKUpdate = false;
 
   state->bbr_status = calloc(1, sizeof(bbr_status_t));
-  init_bbr(state->bbr_status, cfg->rt_timeout, cfg->send_window);
+  
+  init_bbr(state->bbr_status, cfg->rt_timeout, 1000);
 
   return state;
 }
@@ -165,6 +166,8 @@ void ctcp_destroy(ctcp_state_t *state) {
 
   free(state);
   end_client();
+  fprintf(stderr, "destroy!!\n");
+
 }
 
 
@@ -198,7 +201,7 @@ void trySend(ctcp_state_t *state)
 
 
   /*decide how much to send*/
-  uint32_t bbr_limit = bbr_thisTimeSend(state->bbr_status);
+  uint32_t bbr_limit = bbr_thisTimeSend(state->bbr_status, state->seqNum !=1);
   uint32_t dataLen = MAX_SEG_DATA_SIZE > totalUnsentLen? totalUnsentLen: MAX_SEG_DATA_SIZE;
   dataLen = dataLen > state->sendWindow?  state->sendWindow: dataLen;
   dataLen = dataLen > bbr_limit? bbr_limit: dataLen;

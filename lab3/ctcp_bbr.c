@@ -57,7 +57,7 @@ void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sen
   //file
   char temp[255]="random";
   srand((unsigned int)currentTime);
-  sprintf(temp+6, "%d", rand());
+  sprintf(temp+6, "%p", bbr);
   bbr->bdpFile = fopen(temp, "a+");
 
   bbr->have_gotten_rtt_sample = false;
@@ -69,8 +69,8 @@ void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sen
   bbr->have_gotten_rtt_sample = false;
   bbr->min_rtt_ms = min_rtt_estimate;
   bbr->min_rtt_timestamp = currentTime;
-  bbr->time_to_stop_probe_rtt = currentTime;
-  bbr->probe_rtt_done = true;
+  bbr->time_to_stop_probe_rtt = 0;
+  bbr->probe_rtt_done = false;
   //bbr->rtt_count = 0;
   //bbr->next_round_have_gotten_acked = 1;
 
@@ -78,8 +78,7 @@ void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sen
   bbr->cycle_index = 0;
   bbr->current_phase = STARTUP;
 
-  bbr->bw_sample_queue.sample[0].bw = 0;
-  bbr->bw_sample_queue.sample[1] = bbr->bw_sample_queue.sample[2] = bbr->bw_sample_queue.sample[0];
+  
   bbr->reached_full_bw = false;
   bbr->reached_full_bw_count = 0;
   
@@ -90,6 +89,11 @@ void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sen
   bbr->prior_cwnd = default_sendWindw;
 
   bbr->full_bw = bbr->current_cwnd * 1000 / bbr->min_rtt_ms;
+  bw_record_t bw_record = {
+    .bw = bbr->full_bw,
+    .timestamp = currentTime
+  };
+  reset_maxQueue(&(bbr->bw_sample_queue), bw_record);
 
   bbr->applimit_left = 0;
 
@@ -124,7 +128,7 @@ void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
 
 uint32_t calculate_bdp(bbr_status_t *bbr)
 {
-  return bbr->pacing_gain * bbr->min_rtt_ms * bbr->bw_sample_queue.sample[0].bw / 1000;
+  return bbr->pacing_gain * bbr->min_rtt_ms * get_max_maxQueue(&(bbr->bw_sample_queue)) / 1000;
 }
 
 bool should_shift_to_next_cycle(bbr_status_t *bbr, ack_sample_t* sample)
@@ -310,20 +314,18 @@ uint32_t get_current_pacing(bbr_status_t *bbr, ack_sample_t* sample)
 void update_cwnd(bbr_status_t *bbr, ack_sample_t* sample)
 {
   uint32_t expected_cwnd = calculate_bdp(bbr) * bbr->cwnd_gain;
-  bbr->current_cwnd += sample->ackedDataCount;
 
   if(bbr->reached_full_bw)
   {
     bbr->current_cwnd = bbr->current_cwnd > expected_cwnd? expected_cwnd : bbr->current_cwnd; //use the smaller one 
   }
-  else if(expected_cwnd > bbr->inflightData)
-  {
-    bbr->current_cwnd = expected_cwnd - bbr->inflightData;
-  }
   else
   {
-    bbr->current_cwnd = 4;
+    bbr->current_cwnd = expected_cwnd;
   }
+
+  bbr->current_cwnd += sample->ackedDataCount;
+  
 
   if(bbr->current_phase == PROBE_RTT)
   {
@@ -347,13 +349,30 @@ void bbr_update(bbr_status_t*bbr, ack_sample_t* sample)
 void bbr_retransmission_notice(bbr_status_t *bbr)
 {
   bbr->current_cwnd = 4;
+  fprintf(bbr->bdpFile, "retransmission occured \n");
+  fflush(bbr->bdpFile);
+}
+#define DEBUG
+void printBDP(bbr_status_t *bbr)
+{
+    long currentTime = current_time();
+    fprintf(bbr->bdpFile, "%ld, ", currentTime);
+    #ifdef DEBUG
+    fprintf(bbr->bdpFile, "%lf, %d, %d, %d, ",bbr->pacing_gain, bbr->min_rtt_ms, get_max_maxQueue(&(bbr->bw_sample_queue)), bbr->current_cwnd);  
+    #endif
+    uint32_t bdp = calculate_bdp(bbr);
+    fprintf(bbr->bdpFile, "%d\n",bdp*8);
+    
+    fflush(bbr->bdpFile);
+    
 }
 
-//for caller use
-uint32_t bbr_thisTimeSend(bbr_status_t *bbr)
+uint32_t bbr_thisTimeSend(bbr_status_t *bbr, bool shouldPrint)
 {
   long time_dt_ms = current_time() - bbr->lastSentTime;
   uint32_t dataFromPacing = time_dt_ms * bbr->full_bw * bbr->pacing_gain/ 1000;
+  if(shouldPrint)
+    printBDP(bbr);
 
   return (dataFromPacing > bbr->current_cwnd)? bbr->current_cwnd : dataFromPacing;
   
@@ -365,25 +384,3 @@ void bbr_sentNotice(bbr_status_t *bbr, uint32_t data_len, bool is_app_limit)
 }
 
 
-void printBDP(bbr_status_t *bbr, ack_sample_t* sample)
-{
-    long currentTime = current_time();
-    
-    #ifndef DEBUG
-    uint32_t bdp = calculate_bdp(bbr);
-    #endif
-    #ifdef DEBUG
-    endPos += sprintf(&(tempString[endPos]), "%d * ", (int)(state->estimateBandWidthBs));
-    endPos += sprintf(&(tempString[endPos]), "%d = ", (int)(state->rtt));
-    endPos += sprintf(&(tempString[endPos]), "%d", (state->estimateBandWidthBs)*(state->rtt) / 1000);
-    endPos += sprintf(&(tempString[endPos]), " <-> %u  ", (state->inflightData + thisTimeSentData));
-    tempString[endPos++] = ',';
-    endPos += sprintf(&(tempString[endPos]), "%lf", (state->gain));
-    tempString[endPos++] = ',';
-    endPos += sprintf(&(tempString[endPos]), "%d", thisTimeSentData);
-    
-    #endif
-    fprintf(bbr->bdpFile, "%ld, %d\n", currentTime, bdp*8);
-    fflush(bbr->bdpFile);
-    
-}

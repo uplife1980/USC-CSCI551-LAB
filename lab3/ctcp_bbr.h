@@ -40,7 +40,7 @@ typedef struct
   //rtt
   bool have_gotten_rtt_sample;
   uint32_t min_rtt_ms;
-  uint32_t min_rtt_timestamp;
+  long min_rtt_timestamp;
   uint32_t time_to_stop_probe_rtt;
   bool probe_rtt_done;
   //uint32_t rtt_count;
@@ -73,7 +73,7 @@ typedef struct
 void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sendWindw);
 void clean_bbr(bbr_status_t *bbr);
 
-uint32_t bbr_thisTimeSend(bbr_status_t *bbr);
+uint32_t bbr_thisTimeSend(bbr_status_t *bbr, bool shouldPrint);
 void bbr_update(bbr_status_t*bbr, ack_sample_t* sample);
 void bbr_sentNotice(bbr_status_t *bbr, uint32_t dataLen, bool is_app_limit);
 void bbr_retransmission_notice(bbr_status_t *bbr);
