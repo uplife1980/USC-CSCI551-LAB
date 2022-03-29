@@ -13,7 +13,6 @@ static const int bbr_bw_sample_expire_period_round = 10;
 static const int bbr_rtt_expire_period_ms = 10*1000;
 static const int bbr_probe_rtt_lasting_time_ms = 100;
 static const int bbr_alert_havenot_reached_full_bw_count = 10;
-#define  DEBUG
 
 void reset_phase(bbr_status_t *bbr);
 
