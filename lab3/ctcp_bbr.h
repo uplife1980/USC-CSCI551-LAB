@@ -15,12 +15,12 @@ typedef struct
   bool app_limit;
   long timestamp;
   uint32_t packetInflight;
-  int ackedDataCountTotal; //Could have extra acked from prior packets
+  int ackedDataCountReal; //real acked total data
 } ack_sample_t;
 
 typedef struct bw_record
 {
-  long timestamp;
+  uint32_t timestamp; 
   uint32_t bw;
 } bw_record_t;
 
@@ -44,7 +44,7 @@ typedef struct
   long min_rtt_timestamp;
   uint32_t time_to_stop_probe_rtt;
   bool probe_rtt_done;
-  //uint32_t rtt_count;
+  uint32_t rtt_count;
   //uint32_t next_round_have_gotten_acked;
 
   //cycle, phase
@@ -57,8 +57,8 @@ typedef struct
   maxQueue_t bw_sample_queue;
   bool reached_full_bw;
   uint32_t reached_full_bw_count;
-  uint32_t full_bw; //recent full bw, used to determine a further larger bw
-  uint8_t alert_cannot_reach_full_bw_count; 
+  uint32_t full_bw; //This is not current max bw. It is just for marking if we have reached max_bw
+  
 
   //caller use
   double pacing_gain;
@@ -79,7 +79,7 @@ uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint);
 uint32_t bbr_thisTimeSendCwnd(bbr_status_t *bbr);
 void bbr_update(bbr_status_t*bbr, ack_sample_t* sample);
 void bbr_sentNotice(bbr_status_t *bbr, int*);
-void bbr_retransmission_notice(bbr_status_t *bbr);
+void bbr_retransmission_notice(bbr_status_t *bbr, int dataLen);
 
 
 

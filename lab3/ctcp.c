@@ -16,7 +16,7 @@
 #include "ctcp_sys.h"
 #include "ctcp_utils.h"
 #include "ctcp_bbr.h"
-#define DEBUG
+
 
 /**
  * Connection state.
@@ -52,7 +52,11 @@ struct ctcp_state {
   //0--NO FIN, 1--prepare to send FIN 2--has sent FIN
   uint8_t prepareSendFINStatus;
 
+  uint32_t lostSegmentAck;
+  uint8_t lostSegmentAckCount;
+
   bbr_status_t *bbr_status;
+  ll_node_t* fastRecoveryNode;
 
 
 };
@@ -118,6 +122,10 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->prepareSendFINStatus = 0;
   state->singleACKUpdate = false;
 
+  state->lostSegmentAck = 0;
+  state->lostSegmentAckCount = 0;
+  state->fastRecoveryNode = NULL;
+
   state->bbr_status = calloc(1, sizeof(bbr_status_t));
   
   init_bbr(state->bbr_status, cfg->rt_timeout, 1000);
@@ -169,10 +177,51 @@ void ctcp_destroy(ctcp_state_t *state) {
 
 }
 
+void reTransmit(ctcp_state_t *state,  ll_node_t *bufNode)
+{
+  ll_node_t *temp = ll_front(state->sentUnackList);
+  bool isFind = false;
+
+  while(temp)
+  {
+    if(temp == bufNode)
+    {
+      isFind =  true;
+    }
+    temp = temp->next;
+  }
+  if(!isFind)
+  {
+    state->fastRecoveryNode = NULL;
+    return;
+  }
+
+  buffer_t *buf = bufNode->object;
+  long currentTime = current_time();
+  ctcp_segment_t* segment = (ctcp_segment_t*)(buf->data);
+  if(bbr_thisTimeSendPacing(state->bbr_status, false) < buf->len)
+  {
+    return;
+  }
+
+  conn_send(state->conn, segment ,buf->len);
+
+  buf->lastSentTime = currentTime;
+  buf->retryTime++;
+  bbr_retransmission_notice(state->bbr_status, buf->len);
+  state->fastRecoveryNode = bufNode->next;
+}
+
 
 void trySend(ctcp_state_t *state)
 {
   long currentTime = current_time();
+  if(state->fastRecoveryNode)
+  {
+    reTransmit(state, state->fastRecoveryNode);
+    return;
+  }
+
   ll_node_t *bufNode = ll_front(state->unsentList);
   if(!bufNode && !(state->prepareSendFINStatus == 1) && !state->singleACKUpdate)
     return;
@@ -208,9 +257,14 @@ void trySend(ctcp_state_t *state)
   dataLen = dataLen > state->sendWindow?  state->sendWindow: dataLen;
   dataLen = dataLen > bbr_limit_pacing? bbr_limit_pacing: dataLen;
   dataLen = dataLen > bbr_limit_cwnd? bbr_limit_cwnd: dataLen;
-  if(!dataLen && !(state->prepareSendFINStatus ==1 ))
+  if(dataLen == 0 && !(state->prepareSendFINStatus == 1 ))
   {
     shouldInsertToUnackList = false;
+  }
+  if(dataLen == 1)
+  {
+    //todo: I don't know why the receiver can get "00", even I didn't send it.
+    return;
   }
   int originDataLen = dataLen;
 
@@ -338,6 +392,25 @@ void ctcp_read(ctcp_state_t *state) {
 
 }
 
+void triggerFastRecovery(ctcp_state_t *state)
+{
+  uint32_t targetSeqNo = state->lostSegmentAck;
+  ll_node_t *bufNode = ll_front(state->sentUnackList);
+  buffer_t *buf = NULL;
+  
+  while(bufNode)
+  {
+     buf = bufNode->object;
+    uint32_t currentSeqNo = ntohl(((ctcp_segment_t*)(buf->data))->seqno);
+    if(currentSeqNo == targetSeqNo)
+    {
+      reTransmit(state, bufNode);
+      break;
+    }
+    bufNode = bufNode->next;
+  }
+}
+
 void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   uint16_t seglen = ntohs(segment->len);
   uint32_t ackno = ntohl(segment->ackno);
@@ -347,6 +420,12 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   {
     
     //fprintf(stderr, "invaild checksum=%d, segLen=%d, len=%d\n", cksum((void*)segment, seglen), (int)seglen, (int)len);
+    free(segment);
+    return;
+  }
+  if(seglen==21 && !(segment->flags & TH_FIN))
+  {
+    //todo: I don't know why it sends "00" from mininext
     free(segment);
     return;
   }
@@ -368,15 +447,34 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     state->singleACKUpdate = true;
 
  
-  int ackedDataLen = ackno - state->lastAckedSeq;
-
+  int ackedDataLen = (long)ackno - (long)state->lastAckedSeq;
   if(ackedDataLen > 0)
   {
     state->lastAckedSeq =  ackno;
 
   }
+  else if(ackno <= state->lastAckedSeq)
+  {
+    //The peer may lost synchronize, record this packet and prepare to trigger fast recovery.
+    
+    if(state->lostSegmentAck != ackno)
+    {
+      state->lostSegmentAck = ackno;
+      state->lostSegmentAckCount  = 1;
+    }
+    else
+    {
+      state->lostSegmentAckCount ++;
+    }
+    if(state->lostSegmentAckCount == 3)
+    {
+      triggerFastRecovery(state);
+      state->lostSegmentAck = 0;
+      state->lostSegmentAckCount = 0;
+    }
+  }
 
-  //for bbr estimation
+  //for bbr estimation and fast recovery
   //find the max seqNum < ackno in sentUnackList
   ll_node_t *bufNode = ll_back(state->sentUnackList);
   while(bufNode)
@@ -399,7 +497,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
       ack_sample_t sample = {
         .app_limit = buf->appLimit,
         .ackedDataCount = ackno - buf->currentLastestAck ,
-        .ackedDataCountTotal = ackno - ntohl(((ctcp_segment_t*)(bufFirst->data))->seqno),
+        .ackedDataCountReal = ackno - ntohl(((ctcp_segment_t*)(bufFirst->data))->seqno),
         .timestamp = currentTime,
         .isRetried = buf->retryTime > 0?1:0,
         .estimateRTT = currentTime - buf->lastSentTime? currentTime - buf->lastSentTime : 1,
@@ -517,21 +615,13 @@ void ctcp_timer() {
       long currentTime = current_time();
       if(currentTime - buf->lastSentTime > currentState->rtt*5)
       {
-          ctcp_segment_t *segment = (ctcp_segment_t*)(buf->data);
           if(buf->retryTime == 4)
           {
             shouldDestroy = true;
             break;
           }
 
-          
-
-          conn_send(currentState->conn, segment ,buf->len);
-
-          buf->lastSentTime = currentTime;
-          buf->retryTime++;
-          bbr_retransmission_notice(currentState->bbr_status);
-
+          reTransmit(currentState, bufObj);
       }
       bufObj = bufObj->next;
     }
