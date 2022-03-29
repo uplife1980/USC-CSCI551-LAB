@@ -7,11 +7,16 @@ static const int bbr_cycle_size = 8;
 
 static const int bbr_keep_in_flight_packet = 4;
 static const double bbr_full_bw_threshold = 1.25;
-static const int bbr_full_bw_count = 4;
+static const int bbr_full_bw_count = 5;
 
-static const int bbr_bw_sample_expire_period_ms = 500;
+static const int bbr_bw_sample_expire_period_ms = 200;
 static const int bbr_rtt_expire_period_ms = 10*1000;
 static const int bbr_probe_rtt_lasting_time_ms = 100;
+static const int bbr_alert_havenot_reached_full_bw_count = 10;
+#define DEBUG
+
+void reset_phase(bbr_status_t *bbr);
+
 
 uint32_t get_max_maxQueue(maxQueue_t* q)
 {
@@ -25,23 +30,47 @@ uint32_t reset_maxQueue(maxQueue_t* q, bw_record_t rec)
   return q->sample[0].bw;
 }
 
+void debug_maxQueue(bbr_status_t *bbr, maxQueue_t* q)
+{
+  fprintf(bbr->bdpFile, "maxQueue: %ld-%d, %ld-%d, %ld-%d\n", q->sample[0].timestamp, q->sample[0].bw, q->sample[1].timestamp, q->sample[1].bw,q->sample[2].timestamp, q->sample[2].bw);
+}
+
 //need repair in the future (https://code.woboq.org/linux/linux/lib/win_minmax.c.html#minmax_running_max)
 uint32_t insert_data_maxQueue(maxQueue_t *q, bw_record_t rec)
 {
+  if(rec.bw > q->sample[0].bw)
+  {
+    reset_maxQueue(q, rec);
+  }
+  else if (q->sample[0].timestamp == q->sample[1].timestamp || rec.bw >= q->sample[1].bw)
+  {
+    //only one sample here, or a 2nd biggest new bw shows
+    q->sample[1] = q->sample[2] = rec;
+  }
+  else if(q->sample[2].timestamp == q->sample[1].timestamp || rec.bw >= q->sample[2].bw)
+  {
+    //only two samples here
+     q->sample[2] = rec;
+  }
+
   if(rec.timestamp - q->sample[0].timestamp > bbr_bw_sample_expire_period_ms)
   {
     q->sample[0] = q->sample[1];
+    q->sample[1] = q->sample[2];
+    q->sample[2] = rec;
   }
-  if(q->sample[1].bw < rec.bw || rec.timestamp - q->sample[1].timestamp > bbr_bw_sample_expire_period_ms / 4)
+  else if(rec.timestamp - q->sample[1].timestamp > bbr_bw_sample_expire_period_ms / 2)
   {
-    q->sample[2] = q->sample[1];
-    q->sample[1] = rec;
+    q->sample[1] = q->sample[2];
+    q->sample[2] = rec;
   }
-
-  if(rec.timestamp - q->sample[1].timestamp > bbr_bw_sample_expire_period_ms / 2)
+  else if(rec.timestamp - q->sample[2].timestamp > bbr_bw_sample_expire_period_ms / 4)
   {
-    q->sample[2] = q->sample[1];
+    q->sample[2] = rec;
   }
+  
+  
+ 
 
   return q->sample[0].bw;
 }
@@ -81,6 +110,7 @@ void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sen
   
   bbr->reached_full_bw = false;
   bbr->reached_full_bw_count = 0;
+  bbr->alert_cannot_reach_full_bw_count = 0;
   
 
   bbr->pacing_gain = bbr_high_gain;
@@ -113,24 +143,26 @@ void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
 
   uint32_t bw = sample->ackedDataCount *1000 / sample->estimateRTT;
   bbr->round_start = 1;
-  bbr->inflightData -= sample->ackedDataCount;
-  fprintf(bbr->bdpFile, "acked: %d \n", sample->ackedDataCount);
-  fflush(bbr->bdpFile);
+  bbr->inflightData -= sample->ackedDataCountTotal;
 
   if(!sample->app_limit || bw >= get_max_maxQueue(&(bbr->bw_sample_queue)) )
   {
     bw_record_t record = {
     .bw = bw,
-    .timestamp = current_time()
+    .timestamp = sample->timestamp
     };
 
     insert_data_maxQueue(&(bbr->bw_sample_queue), record);
   }
+  #ifdef DEBUG
+  fprintf(bbr->bdpFile, "%ld: Current bw: %d, current rtt: %d\n",sample->timestamp,  bw, sample->estimateRTT);
+  debug_maxQueue(bbr, &bbr->bw_sample_queue);
+  #endif
 }
 
 uint32_t calculate_bdp(bbr_status_t *bbr)
 {
-  return bbr->pacing_gain * bbr->min_rtt_ms * get_max_maxQueue(&(bbr->bw_sample_queue)) / 1000;
+  return bbr->min_rtt_ms *bbr->full_bw / 1000;
 }
 
 bool should_shift_to_next_cycle(bbr_status_t *bbr, ack_sample_t* sample)
@@ -142,13 +174,13 @@ bool should_shift_to_next_cycle(bbr_status_t *bbr, ack_sample_t* sample)
 
   else if(bbr->pacing_gain > 1.0)
   {
-    return has_waited_for_enough_time && (bbr->inflightData >= calculate_bdp(bbr));
+    return has_waited_for_enough_time && (bbr->inflightData >= calculate_bdp(bbr) * bbr->pacing_gain);
   }
   else 
   {
     //bbr->pacing_gain < 1.0
     //because we are trying to drain the pipe, check if we achieve that goal
-    return has_waited_for_enough_time || bbr->inflightData < calculate_bdp(bbr);
+    return has_waited_for_enough_time || bbr->inflightData < calculate_bdp(bbr) * bbr->pacing_gain;
   }
 }
 
@@ -167,26 +199,66 @@ void update_cycle(bbr_status_t *bbr, ack_sample_t* sample)
 
 void update_check_bw_full(bbr_status_t *bbr, ack_sample_t* sample)
 {
-  if(bbr->reached_full_bw ||!bbr->round_start || sample->app_limit)
+  if(!bbr->round_start || sample->app_limit)
     return;
+  
+  // //sometimes mininext will overestimate the bw, so we need to wipe out that sample.
+  // if(bbr->reached_full_bw && bbr->current_phase == PROBE_BW)
+  // {
+  //   if(bbr->full_bw > get_max_maxQueue(&(bbr->bw_sample_queue)) * 1.2)
+  //   {
+  //     bbr->alert_cannot_reach_full_bw_count ++;
+  //   }
+  //   else
+  //   {
+  //     bbr->alert_cannot_reach_full_bw_count = 0;
+  //   }
 
-  uint32_t bw_expect = get_max_maxQueue(&(bbr->bw_sample_queue)) * bbr_full_bw_threshold;
+  //   if(bbr->alert_cannot_reach_full_bw_count == bbr_alert_havenot_reached_full_bw_count)
+  //   {
+  //     bbr->reached_full_bw = false;
+  //     bbr->reached_full_bw_count = 0;
+  //     bbr->alert_cannot_reach_full_bw_count = 0;
+  //     reset_phase(bbr);
+  //   }
+  // }
+  else if(bbr->reached_full_bw)
+  {
+    return;
+  }
+
+  uint32_t bw_expect = bbr->full_bw * bbr_full_bw_threshold;
+  uint32_t bw = sample->ackedDataCount *1000 / sample->estimateRTT;
 
   if(get_max_maxQueue(&(bbr->bw_sample_queue)) > bw_expect)
   {
     //we can expect more
     bbr->full_bw = get_max_maxQueue(&(bbr->bw_sample_queue));
     bbr->reached_full_bw_count = 0;
+    bbr->alert_cannot_reach_full_bw_count = 0;
     return;
   }
   else
   {
     if(++bbr->reached_full_bw_count == bbr_full_bw_count)
     {
-      bbr->reached_full_bw = true; //Once we reached, we never reset again.
-      fprintf(bbr->bdpFile, "Get largest bw: %d \n", bbr->full_bw);
-      fflush(bbr->bdpFile);
-      
+      bbr->reached_full_bw = true; //Once we reached, we never reset again.(Unless in mininext's overestimation)
+      #ifdef DEBUG
+      fprintf(bbr->bdpFile, "full_bw found: %d\n", bbr->full_bw);
+      #endif
+    }
+    else if(bw * 1.5 < bbr->full_bw)
+    {
+      //sometimes mininext will overestimate the bw, so we need to wipe out that sample.
+      bw_record_t record = {
+        .bw = bw,
+        .timestamp = sample->timestamp
+      };
+      reset_maxQueue(&(bbr->bw_sample_queue), record);
+      bbr->full_bw = bw;
+      bbr->reached_full_bw_count = 0;
+      //clear the last "fake" data, and check bw_full again
+      update_check_bw_full(bbr, sample);
     }
     return;
   }  
@@ -217,13 +289,18 @@ void update_check_drain(bbr_status_t *bbr, ack_sample_t* sample)
   if(bbr->current_phase == STARTUP && bbr->reached_full_bw)
   {
     bbr->current_phase = DRAIN;
-  }
+  } 
   if(bbr->current_phase == DRAIN)
   {
-    if(bbr->inflightData < calculate_bdp(bbr))
+    if(bbr->inflightData < calculate_bdp(bbr) * bbr->pacing_gain)
     {
       shift_to_probe_bw(bbr);
     }
+  }
+
+  if(bbr->current_phase == PROBE_BW && sample->estimateRTT > 7 * bbr->min_rtt_ms) 
+  {
+    bbr->current_phase = DRAIN;
   }
 }
 
@@ -327,7 +404,7 @@ void update_cwnd(bbr_status_t *bbr, ack_sample_t* sample)
     bbr->current_cwnd = expected_cwnd;
   }
 
-  bbr->current_cwnd += sample->ackedDataCount;
+  bbr->current_cwnd += sample->ackedDataCountTotal;
   
 
   if(bbr->current_phase == PROBE_RTT)
@@ -355,13 +432,13 @@ void bbr_retransmission_notice(bbr_status_t *bbr)
   fprintf(bbr->bdpFile, "retransmission occured \n");
   fflush(bbr->bdpFile);
 }
-#define DEBUG
+
 void printBDP(bbr_status_t *bbr)
 {
     long currentTime = current_time();
     fprintf(bbr->bdpFile, "%ld, ", currentTime);
     #ifdef DEBUG
-    fprintf(bbr->bdpFile, "%lf, %d, %d <-> %d, %d, ",bbr->pacing_gain, bbr->min_rtt_ms, get_max_maxQueue(&(bbr->bw_sample_queue)),bbr->inflightData, bbr->current_cwnd);  
+    fprintf(bbr->bdpFile, "%lf, %d, %d <-> %d, %d, ",bbr->pacing_gain, bbr->min_rtt_ms, bbr->full_bw,bbr->inflightData, bbr->current_cwnd);  
     #endif
     uint32_t bdp = calculate_bdp(bbr);
     fprintf(bbr->bdpFile, "%d\n",bdp*8);
@@ -372,11 +449,13 @@ void printBDP(bbr_status_t *bbr)
 
 uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint)
 {
-  long time_dt_ms = current_time() - bbr->lastSentTime;
+  long currentTime = current_time();
+  long time_dt_ms = currentTime - bbr->lastSentTime;
   uint32_t dataFromPacing = time_dt_ms * bbr->full_bw * bbr->pacing_gain/ 1000;
   if(shouldPrint)
     printBDP(bbr);
 
+  bbr->lastSentTime = currentTime;
   return dataFromPacing;
   
 }
@@ -386,13 +465,42 @@ uint32_t bbr_thisTimeSendCwnd(bbr_status_t *bbr)
   return bbr->current_cwnd;
 }
 
-void bbr_sentNotice(bbr_status_t *bbr, uint32_t data_len, bool is_app_limit)
+void bbr_sentNotice(bbr_status_t *bbr, int *limit_by_what)
 {
-  bbr->inflightData += data_len;
+  #ifdef DEBUG
+  int i = 0;
+  for(; i < 6; i++)
+  {
+    fprintf(bbr->bdpFile, "%d, " , limit_by_what[i]);
+  }
+  if(limit_by_what[0] == limit_by_what[1])
+  {
+    fprintf(bbr->bdpFile, "[limit: NO]" );
+  }
+  else if(limit_by_what[0] == limit_by_what[2])
+  {
+    fprintf(bbr->bdpFile, "[limit: cwnd]");
+  }
+  else if(limit_by_what[0] == limit_by_what[3])
+  {
+    fprintf(bbr->bdpFile, "[limit: data]");
+  }
+  else if(limit_by_what[0] == limit_by_what[4])
+  {
+    fprintf(bbr->bdpFile, "[limit: MSS]");
+  }
+  else if(limit_by_what[0] == limit_by_what[5])
+  {
+    fprintf(bbr->bdpFile, "[limit: sendWindow]");
+  }
 
-  fprintf(bbr->bdpFile, "[limit:%d] After send inflight: %d\n",is_app_limit, bbr->inflightData);
+
+  bbr->inflightData += limit_by_what[0];
+
+  fprintf(bbr->bdpFile, " After send inflight: %d\n", bbr->inflightData);
     
-    fflush(bbr->bdpFile);
+  fflush(bbr->bdpFile);
+  #endif
 
 }
 

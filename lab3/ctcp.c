@@ -166,8 +166,6 @@ void ctcp_destroy(ctcp_state_t *state) {
 
   free(state);
   end_client();
-  fprintf(stderr, "destroy!!\n");
-  fflush(stderr);
 
 }
 
@@ -203,6 +201,8 @@ void trySend(ctcp_state_t *state)
 
   /*decide how much to send*/
   uint32_t bbr_limit_pacing = bbr_thisTimeSendPacing(state->bbr_status, state->seqNum !=1);
+  bbr_limit_pacing = bbr_limit_pacing > MAX_SEG_DATA_SIZE? MAX_SEG_DATA_SIZE: bbr_limit_pacing;
+  
   uint32_t bbr_limit_cwnd = bbr_thisTimeSendCwnd(state->bbr_status);
   uint32_t dataLen = MAX_SEG_DATA_SIZE > totalUnsentLen? totalUnsentLen: MAX_SEG_DATA_SIZE;
   dataLen = dataLen > state->sendWindow?  state->sendWindow: dataLen;
@@ -267,8 +267,11 @@ void trySend(ctcp_state_t *state)
   segment->cksum = cksum((void*)segment, sizeof(ctcp_segment_t) + dataLen);
 
   state->seqNum += dataLen;
-  bbr_sentNotice(state->bbr_status, dataLen, (dataLen < bbr_limit_pacing));
+  int limitByWhat[] = {dataLen, bbr_limit_pacing, bbr_limit_cwnd, totalUnsentLen, MAX_SEG_DATA_SIZE, state->sendWindow};
+  if(state->seqNum != 1)
+    bbr_sentNotice(state->bbr_status, limitByWhat);
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
+  state->sendWindow -= dataLen;
   
 
 
@@ -388,17 +391,20 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   }
   if(bufNode)
   {
+    buffer_t *bufFirst = ll_front(state->sentUnackList)->object;
     buffer_t *buf = (buffer_t*)(bufNode->object);
     long currentTime = current_time();
     if(!buf->retryTime)
     {
       ack_sample_t sample = {
         .app_limit = buf->appLimit,
-        .ackedDataCount = ackno - buf->currentLastestAck - 1,
+        .ackedDataCount = ackno - buf->currentLastestAck ,
+        .ackedDataCountTotal = ackno - ntohl(((ctcp_segment_t*)(bufFirst->data))->seqno),
         .timestamp = currentTime,
         .isRetried = buf->retryTime > 0?1:0,
-        .estimateRTT = currentTime - buf->lastSentTime,
-        .packetInflight = state->inflightPacket
+        .estimateRTT = currentTime - buf->lastSentTime? currentTime - buf->lastSentTime : 1,
+        .packetInflight = state->inflightPacket,
+
       };
       bbr_update(state->bbr_status, &sample);
     }
