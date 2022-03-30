@@ -34,6 +34,7 @@ typedef struct
   bool round_start;
   //bool idle_restart;
   FILE *bdpFile;
+  FILE *debugFile;
 
   uint32_t inflightData;  
   long lastSentTime;

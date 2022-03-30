@@ -35,4 +35,4 @@ submit: clean
 	@echo
 
 clean:
-	rm -f .*.d *.o $(TAR) *~ ctcp *.csv core log.txt output.txt random* output dst*
+	rm -f .*.d *.o $(TAR) *~ ctcp *.csv core log.txt output.txt random* output dst* debug*

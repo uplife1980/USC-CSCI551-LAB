@@ -13,6 +13,7 @@ static const int bbr_bw_sample_expire_period_round = 10;
 static const int bbr_rtt_expire_period_ms = 10*1000;
 static const int bbr_probe_rtt_lasting_time_ms = 100;
 static const int bbr_alert_havenot_reached_full_bw_count = 10;
+#define DEBUG
 
 void reset_phase(bbr_status_t *bbr);
 
@@ -31,7 +32,7 @@ uint32_t reset_maxQueue(maxQueue_t* q, bw_record_t rec)
 
 void debug_maxQueue(bbr_status_t *bbr, maxQueue_t* q)
 {
-  fprintf(bbr->bdpFile, "maxQueue: %d-%d, %d-%d, %d-%d\n", q->sample[0].timestamp, q->sample[0].bw, q->sample[1].timestamp, q->sample[1].bw,q->sample[2].timestamp, q->sample[2].bw);
+  fprintf(bbr->debugFile, "maxQueue: %d-%d, %d-%d, %d-%d\n", q->sample[0].timestamp, q->sample[0].bw, q->sample[1].timestamp, q->sample[1].bw,q->sample[2].timestamp, q->sample[2].bw);
 }
 
 //need repair in the future (https://code.woboq.org/linux/linux/lib/win_minmax.c.html#minmax_running_max)
@@ -87,6 +88,11 @@ void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sen
   srand((unsigned int)currentTime);
   sprintf(temp+6, "%p", bbr);
   bbr->bdpFile = fopen(temp, "a+");
+  #ifdef DEBUG
+  char debug[255] = "debug";
+  sprintf(debug+5, "%p", bbr);
+  bbr->debugFile = fopen(debug, "a+");
+  #endif
 
   bbr->have_gotten_rtt_sample = false;
   //bbr->idle_restart = false;
@@ -133,6 +139,9 @@ void clean_bbr(bbr_status_t *bbr)
     return;
   
   fclose(bbr->bdpFile);
+  #ifdef DEBUG
+  fclose(bbr->debugFile);
+  #endif
 }
 
 void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
@@ -153,7 +162,7 @@ void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
     insert_data_maxQueue(&(bbr->bw_sample_queue), record);
   }
   #ifdef DEBUG
-  fprintf(bbr->bdpFile, "%ld: Current bw: %d, current rtt: %d\n",sample->timestamp,  bw, sample->estimateRTT);
+  fprintf(bbr->debugFile, "%ld: Current bw: %d, current rtt: %d\n",sample->timestamp,  bw, sample->estimateRTT);
   //debug_maxQueue(bbr, &bbr->bw_sample_queue);
   #endif
 }
@@ -227,7 +236,7 @@ void update_check_bw_full(bbr_status_t *bbr, ack_sample_t* sample)
       {
         bbr->reached_full_bw = true; //Once we reached, we never reset again.(Unless in mininext's overestimation)
         #ifdef DEBUG
-        fprintf(bbr->bdpFile, "[state] full_bw found: %d\n", bbr->full_bw);
+        fprintf(bbr->debugFile, "[state] full_bw found: %d\n", bbr->full_bw);
         #endif
       }
     }
@@ -395,9 +404,11 @@ void bbr_retransmission_notice(bbr_status_t *bbr, int dataLen)
   //bbr->current_cwnd = 4;
   bbr->lastSentTime = current_time();
   #ifdef DEBUG
-  fprintf(bbr->bdpFile, "retransmission occured, size %d \n", dataLen);
-  fflush(bbr->bdpFile);
+  fprintf(bbr->debugFile, "retransmission occured, size %d \n", dataLen);
+  fflush(bbr->debugFile);
   #endif
+  bbr->reached_full_bw = false;
+  reset_phase(bbr);
 }
 
 void printBDP(bbr_status_t *bbr)
@@ -405,12 +416,18 @@ void printBDP(bbr_status_t *bbr)
     long currentTime = current_time();
     fprintf(bbr->bdpFile, "%ld, ", currentTime);
     #ifdef DEBUG
-    fprintf(bbr->bdpFile, "%lf,%d,  %d <->  ",bbr->pacing_gain,bbr->min_rtt_ms, bbr->inflightData*8);  
+    fprintf(bbr->debugFile, "%ld, ", currentTime);
+    fprintf(bbr->debugFile, "%lf,%d,  %d <->  ",bbr->pacing_gain,bbr->min_rtt_ms, bbr->inflightData*8);  
+    
     #endif
     uint32_t bdp = calculate_bdp(bbr);
     fprintf(bbr->bdpFile, "%d\n",bdp*8);
     
     fflush(bbr->bdpFile);
+    #ifdef DEBUG
+    fprintf(bbr->debugFile, "%d\n",bdp*8);
+    fflush(bbr->debugFile);
+    #endif
     
 }
 
@@ -421,11 +438,23 @@ uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint)
   
   uint32_t current_bw = get_max_maxQueue(&(bbr->bw_sample_queue));
   uint32_t dataFromPacing = time_dt_ms * current_bw * bbr->pacing_gain/ 1000;
+  if(bbr->inflightData >= calculate_bdp(bbr) * bbr->pacing_gain)
+  {
+    return 0;
+  }
+
+  if(dataFromPacing + bbr->inflightData > calculate_bdp(bbr) * bbr->pacing_gain)
+  {
+    dataFromPacing = calculate_bdp(bbr) * bbr->pacing_gain - bbr->inflightData;
+  }
   
   if(shouldPrint)
   {
     #ifdef DEBUG
-    fprintf(bbr->bdpFile, "[dataLen] lastTime: %ld, thisTime: %ld, send: %ld*%d*%lf=%d\n",bbr->lastSentTime, currentTime, time_dt_ms, current_bw , bbr->pacing_gain ,dataFromPacing);
+    if(!(dataFromPacing == calculate_bdp(bbr) * bbr->pacing_gain - bbr->inflightData))
+      fprintf(bbr->debugFile, "[dataLen] lastTime: %ld, thisTime: %ld, send: %ld*%d*%lf=%d\n",bbr->lastSentTime, currentTime, time_dt_ms, current_bw , bbr->pacing_gain ,dataFromPacing);
+    else 
+      fprintf(bbr->debugFile, "[dataLen] lastTime: %ld, thisTime: %ld, send limited by bdp: %d\n",bbr->lastSentTime, currentTime ,dataFromPacing);
     #endif
     printBDP(bbr);
   }
@@ -444,30 +473,31 @@ uint32_t bbr_thisTimeSendCwnd(bbr_status_t *bbr)
 void bbr_sentNotice(bbr_status_t *bbr, int *limit_by_what)
 {
   #ifdef DEBUG
+  fprintf(bbr->debugFile, "[data Limit] ");
   int i = 0;
   for(; i < 6; i++)
   {
-    fprintf(bbr->bdpFile, "%d, " , limit_by_what[i]);
+    fprintf(bbr->debugFile, "%d, " , limit_by_what[i]);
   }
   if(limit_by_what[0] == limit_by_what[1])
   {
-    fprintf(bbr->bdpFile, "[limit: NO]" );
+    fprintf(bbr->debugFile, "[limit: NO]" );
   }
   else if(limit_by_what[0] == limit_by_what[2])
   {
-    fprintf(bbr->bdpFile, "[limit: cwnd]");
+    fprintf(bbr->debugFile, "[limit: cwnd]");
   }
   else if(limit_by_what[0] == limit_by_what[3])
   {
-    fprintf(bbr->bdpFile, "[limit: data]");
+    fprintf(bbr->debugFile, "[limit: data]");
   }
   else if(limit_by_what[0] == limit_by_what[4])
   {
-    fprintf(bbr->bdpFile, "[limit: MSS]");
+    fprintf(bbr->debugFile, "[limit: MSS]");
   }
   else if(limit_by_what[0] == limit_by_what[5])
   {
-    fprintf(bbr->bdpFile, "[limit: sendWindow]");
+    fprintf(bbr->debugFile, "[limit: sendWindow]");
   }
   #endif
 
@@ -475,9 +505,9 @@ void bbr_sentNotice(bbr_status_t *bbr, int *limit_by_what)
   bbr->inflightData += limit_by_what[0];
 
   #ifdef DEBUG
-  fprintf(bbr->bdpFile, " After send inflight: %d\n", bbr->inflightData);
+  fprintf(bbr->debugFile, " After send inflight: %d\n", bbr->inflightData);
     
-  fflush(bbr->bdpFile);
+  fflush(bbr->debugFile);
   #endif
   
 
