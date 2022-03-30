@@ -68,6 +68,7 @@ typedef struct
   uint32_t prior_cwnd;
 
   uint32_t applimit_left;
+  uint32_t prior_bw;
     
   
   

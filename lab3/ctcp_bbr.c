@@ -143,7 +143,29 @@ void clean_bbr(bbr_status_t *bbr)
   fclose(bbr->debugFile);
   #endif
 }
-
+void update_congestion(bbr_status_t*bbr, ack_sample_t* sample)
+{
+  if(bbr->applimit_left)
+  {
+    if(sample->ackedDataCountReal >= bbr->applimit_left)
+    {
+      bbr->applimit_left = 0;
+      bbr->current_cwnd = bbr->prior_cwnd;
+      bw_record_t record = {
+        .bw = bbr->prior_bw/2,
+        .timestamp = ++bbr->rtt_count
+      };
+      insert_data_maxQueue(&(bbr->bw_sample_queue), record);
+      #ifdef DEBUG
+      fprintf(bbr->debugFile,"[state] exit congestion mode, use bw: %d \n", record.bw);
+      #endif
+    }
+    else
+    {
+      bbr->applimit_left -= sample->ackedDataCountReal;
+    }
+  }
+}
 void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
 {
   //record the lastest sample bw, but don't update full bw: we will do that in update_check_full_bw()
@@ -317,7 +339,7 @@ void update_min_rtt(bbr_status_t *bbr, ack_sample_t* sample)
 
   if(bbr->current_phase == PROBE_RTT)
   {
-    bbr->applimit_left = bbr->inflightData? bbr->inflightData:1;
+    //bbr->applimit_left = bbr->inflightData? bbr->inflightData:1;
 
     if(!bbr->time_to_stop_probe_rtt /*&& sample->packetInflight <= bbr_keep_in_flight_packet*/)
     {
@@ -388,13 +410,13 @@ void update_cwnd(bbr_status_t *bbr, ack_sample_t* sample)
 
 void bbr_update(bbr_status_t*bbr, ack_sample_t* sample)
 {
+  update_congestion(bbr, sample);
   update_bw(bbr, sample);
   update_cycle(bbr, sample);
   update_check_bw_full(bbr, sample);
   update_check_drain(bbr, sample);
   update_min_rtt(bbr, sample);
   update_gain(bbr, sample);
-  //update_pacing(bbr, sample);
   update_cwnd(bbr, sample);
 
 }
@@ -407,8 +429,20 @@ void bbr_retransmission_notice(bbr_status_t *bbr, int dataLen)
   fprintf(bbr->debugFile, "retransmission occured, size %d \n", dataLen);
   fflush(bbr->debugFile);
   #endif
-  bbr->reached_full_bw = false;
-  reset_phase(bbr);
+  if(!bbr->applimit_left)
+  {
+    bbr->applimit_left = bbr->inflightData;
+    bbr->prior_bw = get_max_maxQueue(&(bbr->bw_sample_queue));
+    bbr->prior_cwnd = bbr->current_cwnd;
+    bbr->current_cwnd = 4;
+    #ifdef DEBUG
+    fprintf(bbr->debugFile, "[state] enter congestion mode, left data: %d\n", bbr->applimit_left);
+    #endif
+  }
+  
+  // bbr->reached_full_bw = false;
+  // bbr->full_bw = get_max_maxQueue(&(bbr->bw_sample_queue))/4;
+  // reset_phase(bbr);
 }
 
 void printBDP(bbr_status_t *bbr)
@@ -438,15 +472,15 @@ uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint)
   
   uint32_t current_bw = get_max_maxQueue(&(bbr->bw_sample_queue));
   uint32_t dataFromPacing = time_dt_ms * current_bw * bbr->pacing_gain/ 1000;
-  if(bbr->inflightData >= calculate_bdp(bbr) * bbr->pacing_gain)
-  {
-    return 0;
-  }
+  // if(bbr->inflightData >= calculate_bdp(bbr) * bbr->pacing_gain)
+  // {
+  //   return 0;
+  // }
 
-  if(dataFromPacing + bbr->inflightData > calculate_bdp(bbr) * bbr->pacing_gain)
-  {
-    dataFromPacing = calculate_bdp(bbr) * bbr->pacing_gain - bbr->inflightData;
-  }
+  // if(dataFromPacing + bbr->inflightData > calculate_bdp(bbr) * bbr->pacing_gain)
+  // {
+  //   dataFromPacing = calculate_bdp(bbr) * bbr->pacing_gain - bbr->inflightData;
+  // }
   
   if(shouldPrint)
   {
