@@ -53,7 +53,7 @@ def config_dumbbell(topo):
     info("*** Creating links between nodes in dumbbell topology\n")
     net.addLink(net.getNodeByName("client1"), net.getNodeByName("router1"), intfName1="meth1", intfName2="client1")
     net.addLink(net.getNodeByName("client2"), net.getNodeByName("router1"), intfName1="meth1", intfName2="client2")
-    net.addLink(net.getNodeByName("router1"), net.getNodeByName("router2"), intfName1="router2", intfName2="router1", bw=1, delay="50ms", loss=1)
+    net.addLink(net.getNodeByName("router1"), net.getNodeByName("router2"), intfName1="router2", intfName2="router1", bw=1, delay="1ms")
     net.addLink(net.getNodeByName("server1"), net.getNodeByName("router2"), intfName1="meth1", intfName2="server1")
     net.addLink(net.getNodeByName("server2"), net.getNodeByName("router2"), intfName1="meth1", intfName2="server2")
 

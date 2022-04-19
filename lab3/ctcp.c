@@ -128,7 +128,7 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 
   state->bbr_status = calloc(1, sizeof(bbr_status_t));
   
-  init_bbr(state->bbr_status, cfg->rt_timeout, 1000);
+  init_bbr(state->bbr_status, cfg->rt_timeout, 10);
 
   return state;
 }
@@ -196,19 +196,22 @@ void reTransmit(ctcp_state_t *state,  ll_node_t *bufNode)
     return;
   }
 
+  bbr_retransmission_notice(state->bbr_status);
+
   buffer_t *buf = bufNode->object;
   long currentTime = current_time();
   ctcp_segment_t* segment = (ctcp_segment_t*)(buf->data);
-  if(bbr_thisTimeSendPacing(state->bbr_status, false) < buf->len)
-  {
-    return;
-  }
+  // if(bbr_thisTimeSendPacing(state->bbr_status, false) < buf->len)
+  // {
+  //   fprintf(stderr, "bbr banned retransmit.\n");
+  //   return;
+  // }
 
   conn_send(state->conn, segment ,buf->len);
 
   buf->lastSentTime = currentTime;
   buf->retryTime++;
-  bbr_retransmission_notice(state->bbr_status, buf->len);
+  
   state->fastRecoveryNode = bufNode->next;
 }
 
@@ -264,6 +267,12 @@ void trySend(ctcp_state_t *state)
   if(dataLen == 1)
   {
     //todo: I don't know why the receiver can get "00", even I didn't send it.
+    return;
+  }
+
+  //small packet, don't send
+  if(dataLen == bbr_limit_pacing && dataLen < totalUnsentLen && dataLen < 10)
+  {
     return;
   }
   int originDataLen = dataLen;
@@ -322,8 +331,7 @@ void trySend(ctcp_state_t *state)
 
   state->seqNum += dataLen;
   int limitByWhat[] = {dataLen, bbr_limit_pacing, bbr_limit_cwnd, totalUnsentLen, MAX_SEG_DATA_SIZE, state->sendWindow};
-  if(state->seqNum != 1)
-    bbr_sentNotice(state->bbr_status, limitByWhat);
+  bbr_sentNotice(state->bbr_status, limitByWhat);
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
   state->sendWindow -= dataLen;
   
@@ -415,6 +423,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   uint16_t seglen = ntohs(segment->len);
   uint32_t ackno = ntohl(segment->ackno);
   uint32_t seqno = ntohl(segment->seqno);
+  long currentTime = current_time();
 
   if(cksum((void*)segment, seglen) != 0xffff || (len != seglen))
   {
@@ -430,7 +439,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     return;
   }
 
-  // I need former packet
+  // I need former packet, this is not what I expected.
   if(seqno != state->ackNum)
   {
     state->singleACKUpdate = true;
@@ -439,7 +448,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     return;    
   }
 
-  /*adjust ACK number*/
+  /*adjust my ACK number*/
   state->ackNum += seglen - sizeof(ctcp_segment_t);
   state->sendWindow = ntohs(segment->window);
 
@@ -450,7 +459,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   if(ackno > state->lastAckedSeq)
   {
     state->lastAckedSeq =  ackno;
-
   }
   else if(ackno < state->seqNum)
   {
@@ -465,7 +473,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     {
       state->lostSegmentAckCount ++;
     }
-    if(state->lostSegmentAckCount == 3)
+    if(state->lostSegmentAckCount >= 3)
     {
       triggerFastRecovery(state);
       state->lostSegmentAck = 0;
@@ -473,14 +481,14 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     }
   }
 
-
+  //find the lastest acked node.
   ll_node_t *bufNode = ll_front(state->sentUnackList);
   int  ackedDataLen = 0;
   while(bufNode)
   {
     buffer_t *buf = (buffer_t*)(bufNode->object);
     uint32_t currentSeqNum = ntohl(((ctcp_segment_t*)(buf->data))->seqno);
-    int dataLen = buf->len - sizeof(ctcp_segment_t);
+    int dataLen = ntohs(((ctcp_segment_t*)(buf->data))->len) - sizeof(ctcp_segment_t);
     if( dataLen + currentSeqNum < ackno)
     {
       ackedDataLen += dataLen;
@@ -492,22 +500,27 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     {
         ackedDataLen += dataLen;
         state->inflightPacket --;
-        long currentTime = current_time();
-        if(!buf->retryTime)
+       
+        ack_sample_t sample = {
+          .app_limit = buf->appLimit,
+          .ackedDataCountFromBuffer = ackno - buf->currentLastestAck ,
+          .ackedDataCountReal = ackedDataLen,
+          .timestamp = currentTime,
+          .isRetried = buf->retryTime > 0?1:0,
+          .estimateRTT = currentTime > buf->lastSentTime ? currentTime - buf->lastSentTime : 1,
+          .packetInflight = state->inflightPacket,
+        };
+        bbr_update(state->bbr_status, &sample);
+
+        if(!sample.isRetried)
         {
-          ack_sample_t sample = {
-            .app_limit = buf->appLimit,
-            .ackedDataCount = ackno - buf->currentLastestAck ,
-            .ackedDataCountReal = ackedDataLen,
-            .timestamp = currentTime,
-            .isRetried = buf->retryTime > 0?1:0,
-            .estimateRTT = currentTime - buf->lastSentTime? currentTime - buf->lastSentTime : 1,
-            .packetInflight = state->inflightPacket,
-          };
-          bbr_update(state->bbr_status, &sample);
+          state->rtt = state->rtt*0.9 + 0.1 * sample.estimateRTT;
+          fprintf(stderr, "new rtt: %d\n", state->rtt);
         }
-          ll_remove(state->sentUnackList, bufNode);
-          cleanBuffer(buf);
+        
+        ll_remove(state->sentUnackList, bufNode);
+        cleanBuffer(buf);
+        break;
     }
     else 
     {
@@ -515,71 +528,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     }
     bufNode = ll_front(state->sentUnackList);
   }
-  //for bbr estimation and fast recovery
-  //find the max seqNum < ackno in sentUnackList
-  // ll_node_t *bufNode = ll_back(state->sentUnackList);
-  // while(bufNode)
-  // {
-  //     buffer_t *buf = (buffer_t*)(bufNode->object);
-  //     uint32_t currentSeqNumInNetOrder = ((ctcp_segment_t*)(buf->data))->seqno;
-  //     if( ntohl(currentSeqNumInNetOrder) < ackno)
-  //     {
-  //         break;
-  //     }
-  //     bufNode = bufNode->prev;
-  // }
-  // if(bufNode)
-  // {
-  //   buffer_t *bufFirst = ll_front(state->sentUnackList)->object;
-  //   buffer_t *buf = (buffer_t*)(bufNode->object);
-  //   long currentTime = current_time();
-  //   if(!buf->retryTime)
-  //   {
-  //     ack_sample_t sample = {
-  //       .app_limit = buf->appLimit,
-  //       .ackedDataCount = ackno - buf->currentLastestAck ,
-  //       .ackedDataCountReal = ackno - ntohl(((ctcp_segment_t*)(bufFirst->data))->seqno),
-  //       .timestamp = currentTime,
-  //       .isRetried = buf->retryTime > 0?1:0,
-  //       .estimateRTT = currentTime - buf->lastSentTime? currentTime - buf->lastSentTime : 1,
-  //       .packetInflight = state->inflightPacket,
-
-  //     };
-  //     bbr_update(state->bbr_status, &sample);
-  //   }
-  // }
-  
-
-  // //delete sentUnackList's object
-  // //Also, FIN packet's len == 1, but it's an empty segment.
-  // ackedDataLen = 0;
-  // while(1)
-  // {
-  //   ll_node_t *bufNode = ll_front(state->sentUnackList);
-  //   if(!bufNode)
-  //     break;
-  //   buffer_t* buf = ((buffer_t*)(bufNode->object));
-  //   uint32_t currentTarget = ntohl(((ctcp_segment_t*)(buf->data))->seqno);
-  //   if(currentTarget >= ackno)
-  //   {
-  //     break;
-  //   }
-  //   ll_remove(state->sentUnackList, bufNode);
-  //   ackedDataLen += buf->len;
-  //   cleanBuffer(buf);
-  //   state->inflightPacket --;
-    
-  // }
-  // while(ackedDataLen > 0)
-  // {
-  //   ll_node_t *bufNode = ll_front(state->sentUnackList);
-  //   buffer_t* buf = ((buffer_t*)(bufNode->object));
-    
-  //   ackedDataLen -= buf->len - sizeof(ctcp_segment_t);
-  //   ll_remove(state->sentUnackList, bufNode);
-  //   cleanBuffer(buf);
-  //   state->inflightPacket --;
-  // }
   
   /*adjust recvWindow*/
   state->recvWindow -= seglen - sizeof(ctcp_segment_t);
@@ -672,7 +620,7 @@ void ctcp_timer() {
     {
       buffer_t* buf = bufObj->object;
       long currentTime = current_time();
-      if(currentTime - buf->lastSentTime > currentState->rtt*5)
+      if(currentTime - buf->lastSentTime > currentState->rtt*2)
       {
           if(buf->retryTime == 4)
           {

@@ -10,7 +10,7 @@ typedef enum{
 typedef struct 
 {
   int estimateRTT;
-  int ackedDataCount;
+  int ackedDataCountFromBuffer;
   bool isRetried;
   bool app_limit;
   long timestamp;
@@ -67,8 +67,8 @@ typedef struct
   uint32_t current_cwnd;
   uint32_t prior_cwnd;
 
-  uint32_t applimit_left;
   uint32_t prior_bw;
+  uint32_t congestion_limit_left;
     
   
   
@@ -81,7 +81,7 @@ uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint);
 uint32_t bbr_thisTimeSendCwnd(bbr_status_t *bbr);
 void bbr_update(bbr_status_t*bbr, ack_sample_t* sample);
 void bbr_sentNotice(bbr_status_t *bbr, int*);
-void bbr_retransmission_notice(bbr_status_t *bbr, int dataLen);
+void bbr_retransmission_notice(bbr_status_t *bbr);
 
 
 
