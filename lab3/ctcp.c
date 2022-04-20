@@ -40,6 +40,7 @@ struct ctcp_state {
                                stop-and-wait protocol and therefore does not
                                necessarily need a linked list. You may remove
                                this if this is the case for you */
+  int unsentTotalCount, unsubmitedTotalCount;
 
   uint16_t sendWindow, recvWindow;
   uint32_t inflightPacket;
@@ -116,6 +117,8 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->timer = cfg->timer;
   free(cfg);
 
+  state->unsentTotalCount = state->unsubmitedTotalCount = 0;
+
   state->seqNum = 1;
   state->ackNum = 1;
   state->lastAckedSeq = 1;
@@ -131,7 +134,7 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 
   state->bbr_status = calloc(1, sizeof(bbr_status_t));
   
-  init_bbr(state->bbr_status, cfg->rt_timeout, 10);
+  init_bbr(state->bbr_status, cfg->rt_timeout, 1000);
 
   return state;
 }
@@ -199,18 +202,19 @@ void reTransmit(ctcp_state_t *state,  ll_node_t *bufNode)
     return;
   }
 
-  bbr_retransmission_notice(state->bbr_status);
+ 
 
   buffer_t *buf = bufNode->object;
-  long currentTime = current_time();
   ctcp_segment_t* segment = (ctcp_segment_t*)(buf->data);
   if(state->retransmit_token == 0)
   {
     return;
   }
   state->retransmit_token --;
+  long currentTime = current_time();
+   bbr_retransmission_notice(state->bbr_status, currentTime);
   // if(bbr_thisTimeSendPacing(state->bbr_status, false) < buf->len)
-  // {
+  // {printBDP
   //   fprintf(stderr, "bbr banned retransmit.\n");
   //   return;
   // }
@@ -226,7 +230,7 @@ void reTransmit(ctcp_state_t *state,  ll_node_t *bufNode)
 
 void trySend(ctcp_state_t *state)
 {
-  long currentTime = current_time();
+  
   if(state->fastRecoveryNode)
   {
     reTransmit(state, state->fastRecoveryNode);
@@ -242,25 +246,11 @@ void trySend(ctcp_state_t *state)
   if(!bufNode && (state->prepareSendFINStatus !=1 ))
     shouldInsertToUnackList = false;
   
-  uint32_t totalUnsentLen = 0;
+  uint32_t totalUnsentLen = state->unsentTotalCount; 
 
-  if(bufNode)
-  {
-     /*calculate all unsentData Length*/
-      buffer_t *buf = bufNode->object;
-      totalUnsentLen = buf->len - buf->usedLen;
-      while(bufNode->next)
-      {
-        bufNode = bufNode->next;
-        buf = bufNode->object;
-        totalUnsentLen += buf->len - buf->usedLen;
-      }
-  }
- 
-
-
+  long currentTime = current_time();
   /*decide how much to send*/
-  uint32_t bbr_limit_pacing = bbr_thisTimeSendPacing(state->bbr_status, state->seqNum !=1);
+  uint32_t bbr_limit_pacing = bbr_thisTimeSendPacing(state->bbr_status, state->seqNum !=1, currentTime);
   bbr_limit_pacing = bbr_limit_pacing > MAX_SEG_DATA_SIZE? MAX_SEG_DATA_SIZE: bbr_limit_pacing;
   
   uint32_t bbr_limit_cwnd = bbr_thisTimeSendCwnd(state->bbr_status);
@@ -278,11 +268,6 @@ void trySend(ctcp_state_t *state)
     return;
   }
 
-  //small packet, don't send
-  if(dataLen == bbr_limit_pacing && dataLen < totalUnsentLen && dataLen < 10)
-  {
-    return;
-  }
   int originDataLen = dataLen;
 
 
@@ -339,9 +324,10 @@ void trySend(ctcp_state_t *state)
 
   state->seqNum += dataLen;
   int limitByWhat[] = {dataLen, bbr_limit_pacing, bbr_limit_cwnd, totalUnsentLen, MAX_SEG_DATA_SIZE, state->sendWindow};
-  bbr_sentNotice(state->bbr_status, limitByWhat);
+  bbr_sentNotice(state->bbr_status, limitByWhat, currentTime);
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
   state->sendWindow -= dataLen;
+  state->unsentTotalCount -= dataLen;
   
 
 
@@ -398,7 +384,11 @@ void ctcp_read(ctcp_state_t *state) {
     }
     buf->len = resLen;
     if(buf->len > 0)
+    {
       ll_add(state->unsentList, buf); 
+      state->unsentTotalCount += buf->len;
+    }
+      
   }while(buf->len > 0);
   
   cleanBuffer(buf);
@@ -432,7 +422,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   uint16_t seglen = ntohs(segment->len);
   uint32_t ackno = ntohl(segment->ackno);
   uint32_t seqno = ntohl(segment->seqno);
-  long currentTime = current_time();
+  
 
   if(cksum((void*)segment, seglen) != 0xffff || (len != seglen))
   {
@@ -482,7 +472,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     {
       state->lostSegmentAckCount ++;
     }
-    if(state->lostSegmentAckCount >= 3)
+    if(state->lostSegmentAckCount == 3)
     {
       triggerFastRecovery(state);
       state->lostSegmentAck = 0;
@@ -507,6 +497,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     } 
     else if(dataLen + currentSeqNum == ackno)
     {
+        long currentTime = current_time();
         ackedDataLen += dataLen;
         state->inflightPacket --;
         if(state->retransmit_token == 0)
@@ -520,7 +511,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
           .ackedDataCountReal = ackedDataLen,
           .timestamp = currentTime,
           .isRetried = buf->retryTime > 0?1:0,
-          .estimateRTT = currentTime > buf->lastSentTime ? currentTime - buf->lastSentTime : 1,
+          .estimateRTT = currentTime > buf->lastSentTime + 10? currentTime - buf->lastSentTime : 10,
           .packetInflight = state->inflightPacket,
         };
         bbr_update(state->bbr_status, &sample);
@@ -557,10 +548,12 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   buf->len = seglen - sizeof(ctcp_segment_t);
   buf->data = malloc(buf->len);
   memcpy(buf->data, segment->data, buf->len);
+  
 
   if(buf->len)
   {
     ll_add(state->unsubmitedList, buf);
+    state->unsubmitedTotalCount += buf->len;
   }
   else
   {
@@ -575,11 +568,14 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
 }
 
 void ctcp_output(ctcp_state_t *state) {
+  
+
   if(state->stopRecv && ll_length(state->unsubmitedList) == 0)
   {
       conn_output(state->conn, NULL, 0);
       return;
   }
+
   size_t availableSize = conn_bufspace(state->conn);
   uint16_t hasOutputCount = 0;
   while(availableSize && ll_length(state->unsubmitedList))
@@ -589,6 +585,7 @@ void ctcp_output(ctcp_state_t *state) {
     if(availableSize >= buf->len - buf->usedLen)
     {
       conn_output(state->conn, buf->data+buf->usedLen, buf->len - buf->usedLen);
+      state->unsubmitedTotalCount -= buf->len - buf->usedLen;
       ll_remove(state->unsubmitedList, bufNode);
       
       hasOutputCount += buf->len - buf->usedLen;
@@ -599,6 +596,7 @@ void ctcp_output(ctcp_state_t *state) {
     {
       conn_output(state->conn, buf->data + buf->usedLen, availableSize);
       buf->usedLen += availableSize;
+      state->unsubmitedTotalCount -= availableSize;
       hasOutputCount += availableSize;
     }
   }
@@ -617,8 +615,10 @@ void ctcp_output(ctcp_state_t *state) {
 }
 
 void ctcp_timer() {
-
   ctcp_state_t *currentState = state_list;
+  if(!currentState)
+    return;
+  long currentTime = current_time();
   while(currentState)
   {
     trySend(currentState);
@@ -631,7 +631,7 @@ void ctcp_timer() {
     while(bufObj)
     {
       buffer_t* buf = bufObj->object;
-      long currentTime = current_time();
+      
       if(currentTime - buf->lastSentTime > currentState->rtt*3)
       {
           if(buf->retryTime == 4)

@@ -77,11 +77,11 @@ typedef struct
 void init_bbr(bbr_status_t *bbr, uint32_t min_rtt_estimate, uint16_t default_sendWindw);
 void clean_bbr(bbr_status_t *bbr);
 
-uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint);
+uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint, long currentTime);
 uint32_t bbr_thisTimeSendCwnd(bbr_status_t *bbr);
 void bbr_update(bbr_status_t*bbr, ack_sample_t* sample);
-void bbr_sentNotice(bbr_status_t *bbr, int*);
-void bbr_retransmission_notice(bbr_status_t *bbr);
+void bbr_sentNotice(bbr_status_t *bbr, int*, long);
+void bbr_retransmission_notice(bbr_status_t *bbr, long);
 
 
 

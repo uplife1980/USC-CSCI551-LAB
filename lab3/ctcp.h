@@ -51,7 +51,7 @@ typedef struct  {
   int currentLastestAck;
   bool appLimit;
 }buffer_t;
-#define BUFFER_SIZE 64
+#define BUFFER_SIZE 512
 #define ABNORMAL_RANGE 1.2
 
 /**
