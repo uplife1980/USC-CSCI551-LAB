@@ -1,0 +1,1 @@
+rm -f random* *.csv debug* output.txt dst* server1_output.txt server2_output.txt
