@@ -62,7 +62,7 @@ tmux send -t client2 "sudo ./ctcp -m -c $SERVER2_IP:$SERVER2_PORT -p $CLIENT2_PO
 
 START_TIME=$(($(date +%s)))
 FILE_SIZE=$(($(stat --printf="%s" $SRC_FILE1)))
-sleep 200
+sleep 30
 
 echo "Ending all nodes"
 tmux kill-session -t client1

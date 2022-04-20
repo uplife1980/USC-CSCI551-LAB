@@ -58,6 +58,8 @@ struct ctcp_state {
   bbr_status_t *bbr_status;
   ll_node_t* fastRecoveryNode;
 
+  int retransmit_token;
+
 
 };
 
@@ -125,6 +127,7 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->lostSegmentAck = 0;
   state->lostSegmentAckCount = 0;
   state->fastRecoveryNode = NULL;
+  state->retransmit_token = 0;
 
   state->bbr_status = calloc(1, sizeof(bbr_status_t));
   
@@ -201,6 +204,11 @@ void reTransmit(ctcp_state_t *state,  ll_node_t *bufNode)
   buffer_t *buf = bufNode->object;
   long currentTime = current_time();
   ctcp_segment_t* segment = (ctcp_segment_t*)(buf->data);
+  if(state->retransmit_token == 0)
+  {
+    return;
+  }
+  state->retransmit_token --;
   // if(bbr_thisTimeSendPacing(state->bbr_status, false) < buf->len)
   // {
   //   fprintf(stderr, "bbr banned retransmit.\n");
@@ -405,6 +413,7 @@ void triggerFastRecovery(ctcp_state_t *state)
   uint32_t targetSeqNo = state->lostSegmentAck;
   ll_node_t *bufNode = ll_front(state->sentUnackList);
   buffer_t *buf = NULL;
+  state->retransmit_token ++;
   
   while(bufNode)
   {
@@ -500,6 +509,10 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
     {
         ackedDataLen += dataLen;
         state->inflightPacket --;
+        if(state->retransmit_token == 0)
+        {
+          state->retransmit_token ++;
+        }
        
         ack_sample_t sample = {
           .app_limit = buf->appLimit,
@@ -515,7 +528,6 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
         if(!sample.isRetried)
         {
           state->rtt = state->rtt*0.9 + 0.1 * sample.estimateRTT;
-          fprintf(stderr, "new rtt: %d\n", state->rtt);
         }
         
         ll_remove(state->sentUnackList, bufNode);
@@ -620,14 +632,14 @@ void ctcp_timer() {
     {
       buffer_t* buf = bufObj->object;
       long currentTime = current_time();
-      if(currentTime - buf->lastSentTime > currentState->rtt*2)
+      if(currentTime - buf->lastSentTime > currentState->rtt*3)
       {
           if(buf->retryTime == 4)
           {
             shouldDestroy = true;
             break;
           }
-
+          currentState->retransmit_token ++;
           reTransmit(currentState, bufObj);
       }
       bufObj = bufObj->next;

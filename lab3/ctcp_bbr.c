@@ -190,15 +190,13 @@ void update_bw(bbr_status_t*bbr, ack_sample_t* sample)
 
   uint32_t bw = sample->ackedDataCountFromBuffer *1000 / sample->estimateRTT;
   bbr->round_start = 1;
-  
+  bbr->inflightData -= sample->ackedDataCountReal;
 
   if(sample->isRetried)
   {
     return;
   }
-
-  //When in congestion stage, inflight data is in congestion_limit_left
-  bbr->inflightData -= sample->ackedDataCountReal;
+  
 
   if(!sample->app_limit || bw >= get_max_maxQueue(&(bbr->bw_sample_queue)) )
   {
@@ -327,10 +325,10 @@ void update_check_drain(bbr_status_t *bbr, ack_sample_t* sample)
     }
   }
 
-  if(bbr->current_phase == PROBE_BW && sample->estimateRTT > bbr_min_rtt_threashold_weight * min_rtt_threashold(bbr)) 
-  {
-    bbr->current_phase = DRAIN;
-  }
+  // if(bbr->current_phase == PROBE_BW && sample->estimateRTT > bbr_min_rtt_threashold_weight * min_rtt_threashold(bbr)) 
+  // {
+  //   bbr->current_phase = DRAIN;
+  // }
 }
 
 void try_finish_probe_rtt(bbr_status_t *bbr, ack_sample_t* sample)
@@ -459,7 +457,6 @@ void bbr_retransmission_notice(bbr_status_t *bbr)
   if(!bbr->congestion_limit_left)
   {
     bbr->congestion_limit_left = bbr->inflightData;
-    bbr->inflightData = 0; //all inflight data is lost
     bbr->prior_bw = get_max_maxQueue(&(bbr->bw_sample_queue));
     bbr->prior_cwnd = bbr->current_cwnd;
     bbr->current_cwnd = 4;
