@@ -164,6 +164,16 @@ void cleanBufferList(linked_list_t* list)
 
   free(list);
 }
+void dealWithExtraCR_Bug(buffer_t * buf)
+{
+  int len = buf->len;
+  if(len >= 2 && buf->data[len-1] == 0x0a && buf->data[len-2] == 0x0d)
+  {
+    buf->len--;
+    buf->data[len-2] = 0x0a;
+  }
+}
+
 
 void ctcp_destroy(ctcp_state_t *state) {
   /* Update linked list. */
@@ -258,7 +268,7 @@ void trySend(ctcp_state_t *state)
   dataLen = dataLen > state->sendWindow?  state->sendWindow: dataLen;
   dataLen = dataLen > bbr_limit_pacing? bbr_limit_pacing: dataLen;
   dataLen = dataLen > bbr_limit_cwnd? bbr_limit_cwnd: dataLen;
-  if(dataLen == 0 && !(state->prepareSendFINStatus == 1 ))
+  if(dataLen == 0 /*&& !(state->prepareSendFINStatus == 1 )*/)
   {
     shouldInsertToUnackList = false;
   }
@@ -325,6 +335,11 @@ void trySend(ctcp_state_t *state)
   state->seqNum += dataLen;
   int limitByWhat[] = {dataLen, bbr_limit_pacing, bbr_limit_cwnd, totalUnsentLen, MAX_SEG_DATA_SIZE, state->sendWindow};
   bbr_sentNotice(state->bbr_status, limitByWhat, currentTime);
+  if(state->seqNum != 1 && dataLen == 0 && state->prepareSendFINStatus == false)
+  {
+    free(segment);
+    return;
+  }
   conn_send(state->conn, segment, sizeof(ctcp_segment_t) + dataLen);
   state->sendWindow -= dataLen;
   state->unsentTotalCount -= dataLen;
@@ -424,13 +439,13 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
   uint32_t seqno = ntohl(segment->seqno);
   
 
-  if(cksum((void*)segment, seglen) != 0xffff || (len != seglen))
-  {
+  // if(cksum((void*)segment, seglen) != 0xffff || (len != seglen))
+  // {
     
-    //fprintf(stderr, "invaild checksum=%d, segLen=%d, len=%d\n", cksum((void*)segment, seglen), (int)seglen, (int)len);
-    free(segment);
-    return;
-  }
+  //   //fprintf(stderr, "invaild checksum=%d, segLen=%d, len=%d\n", cksum((void*)segment, seglen), (int)seglen, (int)len);
+  //   free(segment);
+  //   return;
+  // }
   if(seglen==21 && !(segment->flags & TH_FIN))
   {
     //todo: I don't know why it sends "00" from mininext
@@ -511,7 +526,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
           .ackedDataCountReal = ackedDataLen,
           .timestamp = currentTime,
           .isRetried = buf->retryTime > 0?1:0,
-          .estimateRTT = currentTime > buf->lastSentTime + 10? currentTime - buf->lastSentTime : 10,
+          .estimateRTT = currentTime > buf->lastSentTime + 1? currentTime - buf->lastSentTime : 1,
           .packetInflight = state->inflightPacket,
         };
         bbr_update(state->bbr_status, &sample);
@@ -552,6 +567,10 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
 
   if(buf->len)
   {
+    if(state->stopRecv)
+    {
+      dealWithExtraCR_Bug(buf);
+    }
     ll_add(state->unsubmitedList, buf);
     state->unsubmitedTotalCount += buf->len;
   }
