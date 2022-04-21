@@ -517,8 +517,7 @@ uint32_t bbr_thisTimeSendPacing(bbr_status_t *bbr, bool shouldPrint, long curren
   // {
   //   dataFromPacing = calculate_bdp(bbr) * bbr->pacing_gain - bbr->inflightData;
   // }
-  if(dataFromPacing < 200)
-    return 0;
+
 
   return dataFromPacing;
   

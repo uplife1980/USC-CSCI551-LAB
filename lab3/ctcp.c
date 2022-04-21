@@ -134,7 +134,7 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 
   state->bbr_status = calloc(1, sizeof(bbr_status_t));
   
-  init_bbr(state->bbr_status, cfg->rt_timeout, 1000);
+  init_bbr(state->bbr_status, cfg->rt_timeout, 20);
 
   return state;
 }
@@ -526,7 +526,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
           .ackedDataCountReal = ackedDataLen,
           .timestamp = currentTime,
           .isRetried = buf->retryTime > 0?1:0,
-          .estimateRTT = currentTime > buf->lastSentTime + 1? currentTime - buf->lastSentTime : 1,
+          .estimateRTT = currentTime > buf->lastSentTime + 5? currentTime - buf->lastSentTime : 5,
           .packetInflight = state->inflightPacket,
         };
         bbr_update(state->bbr_status, &sample);
